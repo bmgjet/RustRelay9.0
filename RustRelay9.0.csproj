@@ -1,0 +1,27 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <RootNamespace>RustRelay9._0</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PublishAot>False</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Configurations>Debug;Release;Arm64</Configurations>
+    <Platforms>AnyCPU;ARM64</Platforms>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="LZ4">
+      <HintPath>\Libs\LZ4.dll</HintPath>
+    </Reference>
+    <Reference Include="LZ4pn">
+      <HintPath>\Libs\LZ4pn.dll</HintPath>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>\Libs\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="protobuf-net">
+      <HintPath>\Libs\protobuf-net.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

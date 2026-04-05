@@ -1,0 +1,81 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v9.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v9.0": {
+      "RustRelay9.0/1.0.0": {
+        "dependencies": {
+          "LZ4": "1.0.10.93",
+          "LZ4pn": "1.0.10.93",
+          "Newtonsoft.Json": "13.0.0.0",
+          "protobuf-net": "2.3.5.0"
+        },
+        "runtime": {
+          "RustRelay9.0.dll": {}
+        }
+      },
+      "LZ4/1.0.10.93": {
+        "runtime": {
+          "LZ4.dll": {
+            "assemblyVersion": "1.0.10.93",
+            "fileVersion": "1.0.10.93"
+          }
+        }
+      },
+      "LZ4pn/1.0.10.93": {
+        "runtime": {
+          "LZ4pn.dll": {
+            "assemblyVersion": "1.0.10.93",
+            "fileVersion": "1.0.10.93"
+          }
+        }
+      },
+      "Newtonsoft.Json/13.0.0.0": {
+        "runtime": {
+          "Newtonsoft.Json.dll": {
+            "assemblyVersion": "13.0.0.0",
+            "fileVersion": "13.0.2.0"
+          }
+        }
+      },
+      "protobuf-net/2.3.5.0": {
+        "runtime": {
+          "protobuf-net.dll": {
+            "assemblyVersion": "2.3.5.0",
+            "fileVersion": "2.3.5.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "RustRelay9.0/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "LZ4/1.0.10.93": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "LZ4pn/1.0.10.93": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Newtonsoft.Json/13.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "protobuf-net/2.3.5.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
