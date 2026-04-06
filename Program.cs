@@ -18,6 +18,7 @@ using System.IO.Compression;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using static RustRelayReceiver.ProtoPacketProcessor;
 
 namespace RustRelayReceiver
 {
@@ -102,12 +103,12 @@ namespace RustRelayReceiver
 
         private class WebSocketClient
         {
-            public System.Net.WebSockets.WebSocket Socket { get; set; }
-            public string WipeId { get; set; }
+            public System.Net.WebSockets.WebSocket? Socket { get; set; }
+            public string? WipeId { get; set; }
             public DateTime ConnectedAt { get; set; }
         }
 
-        public static async Task SafeWrite(HttpListenerResponse resp, byte[] data, string contentType = "application/octet-stream")
+        public static void SafeWrite(HttpListenerResponse resp, byte[] data, string contentType = "application/octet-stream")
         {
             try
             {
@@ -128,37 +129,76 @@ namespace RustRelayReceiver
             }
         }
    
-        private static void OnStringPoolReceived(string wipeId, Dictionary<uint, string> stringPool)
+        private static void OnStringPoolReceived(string? wipeId, Dictionary<uint, string> stringPool)
         {
             SaveStringPoolToFile(wipeId, stringPool);
         }
 
-        private static void OnManifestReceived(string wipeId, Dictionary<uint, string> manifest)
+        private static void OnManifestReceived(string? wipeId, Dictionary<uint, string> manifest)
         {
             SaveManifestToFile(wipeId, manifest);
         }
 
-        private static void OnSnapshotReceived(string wipeId, byte[] data)
+        private static void OnSnapshotReceived(string? wipeId, byte[] data)
         {
             SaveSnapshotToFile(wipeId, data);
-            string checksum = ComputeChecksum(data);
-            LogDebug($"[Snapshot] SHA256: {checksum}");
         }
 
-        private static void OnMapFileReceived(string wipeId, string filename, byte[] data)
+        private static void OnMapFileReceived(string? wipeId, string filename, byte[] data)
         {
+            if(wipeId == null) { return; }
             SaveMapFileToDirectory(wipeId, filename, data);
-            string checksum = ComputeChecksum(data);
-            LogDebug($"[MapFile] {filename} - {data.Length} bytes, SHA256: {checksum}");
+            LogDebug($"[MapFile] {filename}");
+        }
+        #endregion
+
+        #region PacketHooks
+        private static void OnEntityReceived(object? sender, Entity entity)
+        {
+            if (entity.baseNetworkable != null)
+            {
+                // LogDebug($"Entity received: ID={entity.baseNetworkable.uid}, PrefabID={entity.baseNetworkable.prefabId}");
+            }
+        }
+
+        private static void OnEntityPositionUpdated(object? sender, NetworkableId EntityId, Vector3? Position, Vector3? Rotation)
+        {
+            //  LogDebug($"Entity Pos: ID={EntityId.Value}");
+        }
+
+        private static void OnEntityDestroyed(object? sender, NetworkableId EntityId)
+        {
+            //    LogDebug($"Entity destroyed: ID={EntityId}");
+        }
+
+        private static void OnRPCMessageReceived(object? sender, uint ID, NetworkableId netid, byte[] data)
+        {
+         //   LogDebug($"RPCMessage: ID={ID}");
+        }
+
+        private static void OnVoiceDataReceived(object? sender, NetworkableId playerid, byte[] voicedata)
+        {
+            //   LogDebug($"VoiceData: ID={playerid.Value}");
+
+        }
+
+        private static void OnEffectReceived(object? sender, string Effectname, Vector3? pos, Vector3? Dir, uint ID)
+        {
+            //    LogDebug($"Effect: {Effectname} at {pos}");
+        }
+
+        private static void OnEntityFlagsUpdated(object? sender, NetworkableId EntityId, uint Flags)
+        {
+            //    LogDebug($"Entity flags update: ID={EntityId}, Flags={Flags}");
         }
         #endregion
 
         #region Processing
-        private static async Task ProcessRequestAsync(HttpListenerContext context)
+        private static async void ProcessRequestAsync(HttpListenerContext context)
         {
             try
             {
-                string serverid = context.Request.Headers["X-Wipe-Id"];
+                string? serverid = context.Request.Headers["X-Wipe-Id"];
                 if (!string.IsNullOrEmpty(serverid)) { CreateDirectories(serverid); }
                 if (context.Request.IsWebSocketRequest){ await HandleWebSocketRequest(context); }
                 else { _ = Task.Run(() => HandleHttpRequest(context));  }
@@ -254,8 +294,8 @@ namespace RustRelayReceiver
                     int contentLength = contentEnd - pos;
                     if (contentLength > 0)
                     {
-                        string filename = ExtractFilename(headers);
-                        string formName = ExtractFormName(headers);
+                        string? filename = ExtractFilename(headers);
+                        string? formName = ExtractFormName(headers);
                         if (!string.IsNullOrEmpty(filename))
                         {
                             byte[] fileContent = new byte[contentLength];
@@ -264,7 +304,7 @@ namespace RustRelayReceiver
                         }
                         else if (!string.IsNullOrEmpty(formName) && formName == "map")
                         {
-                            string originalFilename = ExtractOriginalFilename(headers);
+                            string? originalFilename = ExtractOriginalFilename(headers);
                             if (!string.IsNullOrEmpty(originalFilename)) { filename = originalFilename; }
                             else { filename = $"map_{DateTime.UtcNow:yyyyMMddHHmmss}.bin"; }
                             byte[] fileContent = new byte[contentLength];
@@ -287,9 +327,9 @@ namespace RustRelayReceiver
 
         private static async Task HandleWebSocketRequest(HttpListenerContext context)
         {
-            string wipeId = "";
+            string? wipeId = "";
             var query = context.Request.QueryString;
-            foreach (string key in query.AllKeys) { if (key == "wipeId") { wipeId = query[key]; } }
+            foreach (string? key in query.AllKeys) { if (key == "wipeId") { wipeId = query[key]; } }
             try
             {
                 var wsContext = await context.AcceptWebSocketAsync(null);
@@ -335,12 +375,13 @@ namespace RustRelayReceiver
         {
             var response = context.Response;
             var request = context.Request;
-            string serverTime = request.Headers["X-Server-Time"];
-            string wipeId = request.Headers["X-Wipe-Id"];
-            string auth = request.Headers["Authorization"];
+            string? serverTime = request.Headers["X-Server-Time"];
+            string? wipeId = request.Headers["X-Wipe-Id"];
+            string? auth = request.Headers["Authorization"];
             try
             {
-                string path = request.Url.AbsolutePath.ToLower();
+                string? path = request.Url?.AbsolutePath.ToLower();
+                if (string.IsNullOrEmpty(path)) { await HandleIndexPage(context); return; }
                 if (!string.IsNullOrEmpty(auth) && auth.Replace("Bearer ", "") == _authToken)
                 {
                     if (path == "/api/stringpool" && request.HttpMethod == "POST")
@@ -366,7 +407,7 @@ namespace RustRelayReceiver
                 }
                 else if (path == "/favicon.ico")
                 {
-                    if (File.Exists("favicon.ico")) { await SafeWrite(context.Response, File.ReadAllBytes("favicon.ico"), "image/x-icon"); }
+                    if (File.Exists("favicon.ico")) { SafeWrite(context.Response, File.ReadAllBytes("favicon.ico"), "image/x-icon"); }
                 }
                 else if (path == "/api/servers")
                 {
@@ -429,14 +470,14 @@ namespace RustRelayReceiver
             }
             response.Close();
         }
-
-        private static void ProcessBinaryPacket(byte[] buffer, int length, string wipeId)
+        
+        private static void ProcessBinaryPacket(byte[]? buffer, int length, string? wipeId)
         {
             Interlocked.Increment(ref _totalPacketsReceived);
             UpdateServerStats(wipeId, length);
             if (length < 4) { return; }
             Span<byte> span = buffer.AsSpan(0, length);
-            if (length == 12)
+            if (length == MarkerLength)
             {
                 int magic = BinaryPrimitives.ReadInt32LittleEndian(span);
                 if (magic == MarkerMagic)
@@ -449,11 +490,12 @@ namespace RustRelayReceiver
             int packetId = span[0];
             if (packetId < 140) { return; }
             MessageType type = (MessageType)(packetId - 140);
-            HandleNetworkPacket(type, span, wipeId);
+            //HandleNetworkPacket(type, span, wipeId);
         }
-
+        
         private static async Task HandleModels(HttpListenerContext ctx)
         {
+            if(ctx.Request.Url == null) { return; }
             if (!ctx.Request.Url.AbsolutePath.StartsWith("/models/", StringComparison.OrdinalIgnoreCase)) { return; }
             string rawFileName = ctx.Request.Url.AbsolutePath.Substring("/models/".Length);
             if (rawFileName.Contains('?')) { rawFileName = rawFileName.Split('?')[0]; }
@@ -501,44 +543,38 @@ namespace RustRelayReceiver
                 }
                 ctx.Response.OutputStream.Close();
             }
-            catch (Exception ex)
+            catch
             {
                 ctx.Response.StatusCode = 500;
                 ctx.Response.OutputStream.Close();
             }
         }
 
-        private static void HandleMarker(string wipeId, long serverTicks)
+        private static void HandleMarker(string? wipeId, long serverTicks)
         {
-
+            if (wipeId == null) return;
         }
 
-        private static void HandleNetworkPacket(MessageType type, Span<byte> packet, string wipeId)
+        private static void HandleNetworkPacket(MessageType type, Span<byte> packet, string? wipeId)
         {
-            switch (type)
-            {
-                case MessageType.Entities:
-                    //DecodeEntities(packet, wipeId);
-                    break;
-                case MessageType.EntityPosition:
-                    // DecodeEntityPosition(packet, wipeId);
-                    break;
-                case MessageType.RPCMessage:
-                case MessageType.EntityDestroy:
-                case MessageType.Effect:
-                case MessageType.VoiceData:
-                case MessageType.EntityFlags:
-                    break;
-                default:
-                    break;
-            }
+            if (wipeId == null) { return; }
+            PacketHandler _handler = CreateHandler(
+                onEntity: e => OnEntityReceived(wipeId, e.Entity),
+                onPositionUpdate: e => OnEntityPositionUpdated(wipeId, e.EntityId,e.Position,e.Rotation),
+                onEntityDestroy: e => OnEntityDestroyed(wipeId,e.EntityId),
+                onRPC: e => OnRPCMessageReceived(wipeId, e.RPCId,e.TargetEntity,e.Data),
+                onEffect: e => OnEffectReceived(wipeId, e.EffectName, e.Position, e.Direction, e.EntityId),
+                onEntityFlags: e => OnEntityFlagsUpdated(wipeId, e.EntityId, e.Flags),
+                onVoice: e => OnVoiceDataReceived(wipeId, e.PlayerId, e.AudioData)
+            );
+            _handler.HandleNetworkPacket(type, packet.ToArray(), wipeId);
         }
 
         private static async Task HandleIndexPage(HttpListenerContext context)
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             CookieCollection cookies = request.Cookies;
             foreach (Cookie cookie in cookies)
             {
@@ -556,7 +592,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -577,7 +613,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -591,14 +627,14 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            string wipeId = path.Replace("/api/server/", "").Replace("/api/server", "");
+            string? path = request.Url?.AbsolutePath;
+            string? wipeId = path?.Replace("/api/server/", "").Replace("/api/server", "");
             if (string.IsNullOrEmpty(wipeId))
             {
                 await SendJsonResponse(response, 400, new { error = "Server ID required" });
                 return;
             }
-            ServerInfo server = null;
+            ServerInfo? server = null;
             lock (_serversLock) { server = _connectedServers.FirstOrDefault(s => s.wipeId == wipeId); }
             if (server == null)
             {
@@ -701,7 +737,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -715,15 +751,15 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            string wipeId = path.Replace("/api/paths/", "").Split('/')[0];
+            string? path = request.Url?.AbsolutePath;
+            string? wipeId = path?.Replace("/api/paths/", "").Split('/')[0];
             int page = 1;
             int.TryParse(request.QueryString["page"], out page);
             if (page < 1) page = 1;
             const int pageSize = 50;
             try
             {
-                WorldSerialization worldSerialization = GetCachedWorldSerialization(wipeId);
+                WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
                 if (worldSerialization == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
@@ -741,12 +777,11 @@ namespace RustRelayReceiver
             }
         }
 
-
         private static async Task HandlePrefabsApi(HttpListenerContext context)
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -760,16 +795,16 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            string wipeId = path.Replace("/api/prefabs/", "").Split('/')[0];
+            string? path = request.Url?.AbsolutePath;
+            string? wipeId = path?.Replace("/api/prefabs/", "").Split('/')[0];
             int page = 1;
             int.TryParse(request.QueryString["page"], out page);
             if (page < 1) page = 1;
-            string category = request.QueryString["category"];
+            string? category = request.QueryString["category"];
             const int pageSize = 100;
             try
             {
-                WorldSerialization worldSerialization = GetCachedWorldSerialization(wipeId);
+                WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
                 if (worldSerialization == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
@@ -805,7 +840,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -819,13 +854,13 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            var parts = path.Replace("/api/mapdata/", "").Split('/');
-            string wipeId = parts[0];
-            string layerName = parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : "";
+            string? path = request.Url?.AbsolutePath;
+            string[]? parts = path?.Replace("/api/mapdata/", "").Split('/');
+            string? wipeId = parts?[0];
+            string? layerName = parts?.Length > 1 ? Uri.UnescapeDataString(parts[1]) : "";
             try
             {
-                WorldSerialization worldSerialization = GetCachedWorldSerialization(wipeId);
+                WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
                 if (worldSerialization == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
@@ -852,7 +887,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             foreach (Cookie cookie in request.Cookies)
             {
                 if (cookie.Name == "auth")
@@ -869,9 +904,9 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            var parts = path.Replace("/api/download/", "").Split('/');
-            if (parts.Length < 2)
+            string? path = request.Url?.AbsolutePath;
+            string[]? parts = path?.Replace("/api/download/", "").Split('/');
+            if (parts?.Length < 2)
             {
                 response.StatusCode = 400;
                 byte[] buffer = Encoding.UTF8.GetBytes("Invalid path");
@@ -879,12 +914,13 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
                 return;
             }
-            string wipeId = parts[0];
-            string fileType = parts[1];
-            string filename = parts.Length > 2 ? Uri.UnescapeDataString(string.Join("/", parts.Skip(2))) : "";
+            string? wipeId = parts?[0];
+            if(wipeId == null) { return; }
+            string? fileType = parts?[1];
+            string? filename = parts?.Length > 2 ? Uri.UnescapeDataString(string.Join("/", parts.Skip(2))) : "";
             try
             {
-                string filePath = "";
+                string? filePath = "";
                 if (fileType == "map" && !string.IsNullOrEmpty(filename))
                 {
                     filePath = Path.Combine(DataDirectory, wipeId, "Maps", SanitizeFilename(filename));
@@ -930,7 +966,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             CookieCollection cookies = request.Cookies;
             foreach (Cookie cookie in cookies)
             {
@@ -945,7 +981,7 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string wipeId = request.Url.AbsolutePath.Replace("/3dmap/data/", "").Replace("/3dmap/data/", "");
+            string? wipeId = request.Url?.AbsolutePath.Replace("/3dmap/data/", "").Replace("/3dmap/data/", "");
             if (string.IsNullOrEmpty(wipeId))
             {
                 await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
@@ -965,8 +1001,8 @@ namespace RustRelayReceiver
                 List<object[]> mapRails = new List<object[]>();
                 List<object[]> mapRivers = new List<object[]>();
                 List<object> prefabs = new List<object>();
-                byte[] heightBytes = null;
-                byte[] splatBytes = null;
+                byte[]? heightBytes = null;
+                byte[]? splatBytes = null;
                 int heightRes = 0;
                 int splatRes = 0;
                 int worldsize = 4500;
@@ -1001,7 +1037,7 @@ namespace RustRelayReceiver
                     {
                         foreach (var pd in worldSerialization.world.prefabs)
                         {
-                            string name = GetStringFromPool(wipeId, pd.id);
+                            string? name = GetStringFromPool(wipeId, pd.id);
                             if (string.IsNullOrEmpty(name))
                                 continue;
 
@@ -1040,8 +1076,8 @@ namespace RustRelayReceiver
                             }
                             else if (name.Contains("monument") || name.Contains("unique_environment") || name.Contains("tunnel-entrance") || name.Contains("platform") || name.Contains("power substations") || name.Contains("iceberg") || name.Contains("ice_lakes"))
                             {
-                                ProtoBuf.Vector3 postion = pd.position;
-                                if (postion.y <= -499) { postion.y = 0; }
+                                Vector3 postion = pd.position;
+                                if (postion.Y <= -499) { postion.Y = 0; }
                                 name = Path.GetFileNameWithoutExtension(name);
                                 if (name.Contains("desert_military_base")) { name = "desert_military_base"; }
                                 else if (name.Contains("mining_quarry")) { name = "mining_quarry"; }
@@ -1062,12 +1098,14 @@ namespace RustRelayReceiver
                     if (mapData?.data != null)
                     {
                         heightBytes = DownsampleMap(mapData.data, 2);
+                        if(heightBytes == null) { return; }
                         heightRes = (int)Math.Sqrt(heightBytes.Length / 2);
                     }
                     mapData = worldSerialization.GetMap("splat");
                     if (mapData?.data != null)
                     {
                         splatBytes = DownsampleMap(mapData.data, 8);
+                        if (splatBytes == null) { return; }
                         splatRes = (int)Math.Sqrt(splatBytes.Length / 8);
                     }
                 }
@@ -1108,7 +1146,7 @@ namespace RustRelayReceiver
                         writer.Flush();
                     }
                     byte[] compressedBytes = ms.ToArray();
-                    await SafeWrite(response, compressedBytes, "application/json");
+                    SafeWrite(response, compressedBytes, "application/json");
                 }
             }
             catch (Exception ex)
@@ -1124,7 +1162,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             CookieCollection cookies = request.Cookies;
             foreach (Cookie cookie in cookies)
             {
@@ -1139,7 +1177,7 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 401, new { error = "Unauthorized" });
                 return;
             }
-            string wipeId = request.Url.AbsolutePath.Replace("/3dviewer/", "").Replace("/3dviewer/", "");
+            string? wipeId = request.Url?.AbsolutePath.Replace("/3dviewer/", "").Replace("/3dviewer/", "");
             if (string.IsNullOrEmpty(wipeId))
             {
                 await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
@@ -1152,7 +1190,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string authCookie = null;
+            string? authCookie = null;
             CookieCollection cookies = request.Cookies;
             foreach (Cookie cookie in cookies)
             {
@@ -1168,8 +1206,8 @@ namespace RustRelayReceiver
                 await SendHtmlResponse(response, 200, HTML.GetIndexHtmlBytes(isAuthenticated));
                 return;
             }
-            string path = request.Url.AbsolutePath;
-            string wipeId = path.Replace("/server/", "").Replace("/server", "");
+            string? path = request.Url?.AbsolutePath;
+            string? wipeId = path?.Replace("/server/", "").Replace("/server", "");
             if (string.IsNullOrEmpty(wipeId))
             {
                 await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
@@ -1178,10 +1216,11 @@ namespace RustRelayReceiver
             await SendHtmlResponse(response, 200, HTML.GetServerDetailHtmlBytes(wipeId, isAuthenticated));
         }
 
-        public static string DecryptMapDataName(int PreFabCount, string EncryptedData)
+        public static string? DecryptMapDataName(int PreFabCount, string? EncryptedData)
         {
             try
             {
+                if(EncryptedData == null) { return string.Empty; }
                 using (var aes = Aes.Create())
                 {
                     var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), new byte[] { 73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118 });
@@ -1231,7 +1270,7 @@ namespace RustRelayReceiver
             var response = context.Response;
             string body;
             using (var reader = new StreamReader(request.InputStream)) { body = await reader.ReadToEndAsync(); }
-            string password = null;
+            string? password = null;
             if (body.Contains("password="))
             {
                 int idx = body.IndexOf("password=") + 9;
@@ -1250,7 +1289,7 @@ namespace RustRelayReceiver
             await SendJsonResponse(response, success ? 200 : 401, new { success = success });
         }
 
-        private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, string html, Dictionary<string, string> additionalHeaders = null)
+        private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, string html, Dictionary<string, string>? additionalHeaders = null)
         {
             response.StatusCode = statusCode;
             response.ContentType = "text/html; charset=utf-8";
@@ -1269,7 +1308,7 @@ namespace RustRelayReceiver
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
         }
 
-        private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, byte[] html, Dictionary<string, string> additionalHeaders = null)
+        private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, byte[] html, Dictionary<string, string>? additionalHeaders = null)
         {
             response.StatusCode = statusCode;
             response.ContentType = "text/html; charset=utf-8";
@@ -1286,7 +1325,7 @@ namespace RustRelayReceiver
             await response.OutputStream.WriteAsync(html, 0, html.Length);
         }
 
-        private static async Task HandleStringPoolUpload(HttpListenerContext context, string wipeId)
+        private static async Task HandleStringPoolUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
             var response = context.Response;
@@ -1310,7 +1349,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static async Task HandleManifestUpload(HttpListenerContext context, string wipeId)
+        private static async Task HandleManifestUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
             var response = context.Response;
@@ -1334,7 +1373,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static async Task HandleSnapshotUpload(HttpListenerContext context, string wipeId)
+        private static async Task HandleSnapshotUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
             var response = context.Response;
@@ -1357,7 +1396,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static async Task HandleMapSnapshotUpload(HttpListenerContext context, string wipeId)
+        private static async Task HandleMapSnapshotUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
             var response = context.Response;
@@ -1367,7 +1406,6 @@ namespace RustRelayReceiver
                 LogDebug($"[MapSnapshot] wipeId={wipeId}, files={files.Count}");
                 foreach (var file in files)
                 {
-                    LogDebug($"  - {file.Key}: {file.Value.Length} bytes");
                     OnMapFileReceived(wipeId, file.Key, file.Value);
                     MarkServerFileReceived(wipeId, "map");
                 }
@@ -1379,17 +1417,18 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 400, new { error = ex.Message });
             }
         }
-        private static MapInfo LoadMapInfo(string wipeId)
+        private static MapInfo? LoadMapInfo(string wipeId)
         {
             var mapInfo = new MapInfo();
             try
             {
-                WorldSerialization worldSerialization = GetCachedWorldSerialization(wipeId);
+                WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
                 if (worldSerialization == null) { return mapInfo; }
-                var tempdata = worldSerialization.GetMap("topology").data;
-                var Topology = new int[tempdata.Length];
-                Buffer.BlockCopy(tempdata, 0, Topology, 0, Topology.Length);
-                MapRender mapRender = new MapRender(worldSerialization.GetMap("splat").data, Topology);
+                byte[]? tempdata = worldSerialization.GetMap("topology")?.data;
+                if(tempdata == null) { return null; }
+                int[]? Topology = new int[tempdata.Length];
+                   Buffer.BlockCopy(tempdata, 0, Topology, 0, Topology.Length);
+                MapRender? mapRender = new MapRender(worldSerialization?.GetMap("splat")?.data, Topology);
                 mapInfo.png = CompressAndEncode(mapRender.Render());
                 mapInfo.worldsize = (int)worldSerialization.world.size;
                 mapInfo.mapCount = worldSerialization.world.maps.Count;
@@ -1433,13 +1472,13 @@ namespace RustRelayReceiver
             {
                 try
                 {
-                    Console.WriteLine("Downloading Models...");
+                    LogDebug("Downloading Models...");
                     client.DownloadFile(url, zipPath);
-                    Console.WriteLine("Extracting Models...");
+                    LogDebug("Extracting Models...");
                     ZipFile.ExtractToDirectory(zipPath, rootPath);
                     File.Delete(zipPath);
                 }
-                catch (Exception ex) { Console.WriteLine("Error: " + ex.Message); }
+                catch (Exception ex) { LogDebug("Error: " + ex.Message); }
             }
         }
 
@@ -1528,7 +1567,7 @@ namespace RustRelayReceiver
                 {
                     try
                     {
-                        client.Socket.CloseAsync(
+                        client?.Socket?.CloseAsync(
                             System.Net.WebSockets.WebSocketCloseStatus.NormalClosure,
                             "Server shutdown",
                             CancellationToken.None).Wait(1000);
@@ -1572,7 +1611,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static void TrackServerActivity(string wipeId)
+        private static void TrackServerActivity(string? wipeId)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
             lock (_serversLock)
@@ -1596,7 +1635,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static void UpdateServerStats(string wipeId, int bytesReceived)
+        private static void UpdateServerStats(string? wipeId, int bytesReceived)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
             lock (_serversLock)
@@ -1611,7 +1650,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static void MarkServerFileReceived(string wipeId, string fileType)
+        private static void MarkServerFileReceived(string? wipeId, string fileType)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
 
@@ -1626,19 +1665,20 @@ namespace RustRelayReceiver
             }
         }
 
-        private static string GetStringFromPool(string wipeId, uint id)
+        private static string? GetStringFromPool(string? wipeId, uint id)
         {
             lock (_stringPoolLock)
             {
-                if (_globalStringPool.TryGetValue(id, out string cachedValue)) { return cachedValue; }
+                if (_globalStringPool.TryGetValue(id, out string? cachedValue)) { return cachedValue; }
                 LoadWipeStringToGlobalPool(wipeId);
-                if (_globalStringPool.TryGetValue(id, out string newValue)) { return newValue; }
+                if (_globalStringPool.TryGetValue(id, out string? newValue)) { return newValue; }
                 return SearchAllWipesForId(id);
             }
         }
 
-        private static void LoadWipeStringToGlobalPool(string wipeId)
+        private static void LoadWipeStringToGlobalPool(string? wipeId)
         {
+            if(wipeId == null) return;
             string stringPoolsDir = Path.Combine(DataDirectory, wipeId, "StringPools");
             if (!Directory.Exists(stringPoolsDir)) return;
             var latestFile = Directory.GetFiles(stringPoolsDir, "*.json").Select(f => new FileInfo(f)).OrderByDescending(f => f.LastWriteTimeUtc).FirstOrDefault();
@@ -1660,14 +1700,14 @@ namespace RustRelayReceiver
             catch (Exception ex) { LogDebug($"[StringPool] Error loading {latestFile.Name}: {ex.Message}"); }
         }
 
-        private static string SearchAllWipesForId(uint id)
+        private static string? SearchAllWipesForId(uint id)
         {
             var wipeDirs = Directory.GetDirectories(DataDirectory);
             foreach (var dir in wipeDirs)
             {
                 string currentWipeId = Path.GetFileName(dir);
                 LoadWipeStringToGlobalPool(currentWipeId);
-                if (_globalStringPool.TryGetValue(id, out string found)) { return found; }
+                if (_globalStringPool.TryGetValue(id, out string? found)) { return found; }
             }
             return null;
         }
@@ -1682,7 +1722,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static byte[] DownsampleMap(byte[] data, int stepSize)
+        private static byte[]? DownsampleMap(byte[] data, int stepSize)
         {
             if (data == null || data.Length == 0) return null;
             int srcRes = (int)Math.Sqrt(data.Length / stepSize);
@@ -1704,7 +1744,7 @@ namespace RustRelayReceiver
             }
             return result;
         }
-        private static string ExtractFormName(string headers)
+        private static string? ExtractFormName(string headers)
         {
             int nameIndex = headers.IndexOf("name=\"");
             if (nameIndex >= 0)
@@ -1733,7 +1773,7 @@ namespace RustRelayReceiver
             return null;
         }
 
-        private static string ExtractOriginalFilename(string headers)
+        private static string? ExtractOriginalFilename(string headers)
         {
             int nameIndex = headers.IndexOf("filename=", StringComparison.OrdinalIgnoreCase);
             if (nameIndex >= 0)
@@ -1785,15 +1825,16 @@ namespace RustRelayReceiver
                 Directory.CreateDirectory(mapDir);
                 string filepath = Path.Combine(mapDir, SanitizeFilename(filename));
                 lock (FileWriteLock) { File.WriteAllBytes(filepath, data); }
-                LogDebug($"[STORAGE] Map file saved: {filepath}");
+                LogDebug($"[STORAGE] Map file saved: {wipeId}");
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Map file: {ex.Message}"); }
         }
 
-        private static WorldSerialization GetCachedWorldSerialization(string wipeId)
+        private static WorldSerialization? GetCachedWorldSerialization(string? wipeId)
         {
             lock (_mapCacheLock)
             {
+                if (wipeId == null) { return null; }
                 string mapsDir = Path.Combine(DataDirectory, wipeId, "Maps");
                 if (!Directory.Exists(mapsDir)) return null;
                 var mapFiles = Directory.GetFiles(mapsDir, "*.map");
@@ -1813,7 +1854,7 @@ namespace RustRelayReceiver
             }
         }
 
-        private static string ExtractFilename(string headers)
+        private static string? ExtractFilename(string headers)
         {
             int nameIndex = headers.IndexOf("filename=\"");
             if (nameIndex < 0) { return null; }
@@ -1823,11 +1864,12 @@ namespace RustRelayReceiver
             return headers.Substring(start, end - start);
         }
 
-        private static void SaveStringPoolToFile(string wipeId, Dictionary<uint, string> stringPool)
+        private static void SaveStringPoolToFile(string? wipeId, Dictionary<uint, string> stringPool)
         {
             try
             {
                 string filename = $"stringpool.json";
+                if(wipeId == null) { return; }
                 string filepath = Path.Combine(DataDirectory, wipeId, "StringPools", SanitizeFilename(filename));
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
@@ -1841,16 +1883,17 @@ namespace RustRelayReceiver
                 sb.AppendLine();
                 sb.AppendLine("}");
                 lock (FileWriteLock) { File.WriteAllText(filepath, sb.ToString()); }
-                LogDebug($"[STORAGE] StringPool saved: {filepath}");
+                LogDebug($"[STORAGE] StringPool saved: {wipeId}");
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save StringPool: {ex.Message}"); }
         }
 
-        private static void SaveManifestToFile(string wipeId, Dictionary<uint, string> manifest)
+        private static void SaveManifestToFile(string? wipeId, Dictionary<uint, string> manifest)
         {
             try
             {
                 string filename = $"manifest.json";
+                if(wipeId == null) { return; }
                 string filepath = Path.Combine(DataDirectory, wipeId, "Manifests", SanitizeFilename(filename));
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
@@ -1864,15 +1907,16 @@ namespace RustRelayReceiver
                 sb.AppendLine();
                 sb.AppendLine("}");
                 lock (FileWriteLock) { File.WriteAllText(filepath, sb.ToString()); }
-                LogDebug($"[STORAGE] Manifest saved: {filepath}");
+                LogDebug($"[STORAGE] Manifest saved: {wipeId}");
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Manifest: {ex.Message}"); }
         }
 
-        private static void SaveSnapshotToFile(string wipeId, byte[] data)
+        private static void SaveSnapshotToFile(string? wipeId, byte[] data)
         {
             try
             {
+                if(wipeId == null) { return ; }
                 string snapshotDir = Path.Combine(DataDirectory, wipeId, "Snapshots");
                 Directory.CreateDirectory(snapshotDir);
                 var existingFiles = new DirectoryInfo(snapshotDir).GetFiles("snapshot_*.sav").OrderByDescending(f => f.CreationTimeUtc).ToList();
@@ -1881,7 +1925,7 @@ namespace RustRelayReceiver
                 string filename = $"snapshot_{timestamp}.sav";
                 string filepath = Path.Combine(snapshotDir, SanitizeFilename(filename));
                 lock (FileWriteLock) { File.WriteAllBytes(filepath, data); }
-                LogDebug($"[STORAGE] Snapshot saved: {filepath} ({data.Length} bytes)");
+                LogDebug($"[STORAGE] Snapshot saved: {Path.GetFileName(filepath)} ({wipeId})");
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Snapshot: {ex.Message}"); }
         }
@@ -1963,46 +2007,705 @@ namespace RustRelayReceiver
         }
     }
 
-    public enum MessageType : byte
+    public static class ProtoPacketProcessor
     {
-        First,
-        Welcome,
-        Auth,
-        Approved,
-        Ready,
-        Entities,
-        EntityDestroy,
-        GroupChange,
-        GroupDestroy,
-        RPCMessage,
-        EntityPosition,
-        ConsoleMessage,
-        ConsoleCommand,
-        Effect,
-        DisconnectReason,
-        Tick,
-        Message,
-        RequestUserInformation,
-        GiveUserInformation,
-        GroupEnter,
-        GroupLeave,
-        VoiceData,
-        EAC,
-        EntityFlags,
-        World,
-        ConsoleReplicatedVars,
-        QueueUpdate,
-        SyncVar,
-        PackedSyncVar,
-        Last = 28,
-        Count,
-        DemoDisconnection = 50,
-        DemoTransientEntities
+        #region Enums
+        public enum MessageType : byte
+        {
+            First,
+            Welcome,
+            Auth,
+            Approved,
+            Ready,
+            Entities,
+            EntityDestroy,
+            GroupChange,
+            GroupDestroy,
+            RPCMessage,
+            EntityPosition,
+            ConsoleMessage,
+            ConsoleCommand,
+            Effect,
+            DisconnectReason,
+            Tick,
+            Message,
+            RequestUserInformation,
+            GiveUserInformation,
+            GroupEnter,
+            GroupLeave,
+            VoiceData,
+            EAC,
+            EntityFlags,
+            World,
+            ConsoleReplicatedVars,
+            QueueUpdate,
+            SyncVar,
+            PackedSyncVar,
+            Last = 28,
+            Count,
+            DemoDisconnection = 50,
+            DemoTransientEntities
+        }
+
+        #endregion
+
+        #region Structs
+        public struct NetworkableId : IEquatable<NetworkableId>
+        {
+            public ulong Value { get; set; }
+            public bool IsValid => Value > 0;
+            public static NetworkableId Empty => new(0);
+
+            public NetworkableId(ulong value)
+            {
+                Value = value;
+            }
+
+            public bool Equals(NetworkableId other) => Value == other.Value;
+            public override bool Equals(object? obj) => obj is NetworkableId other && Equals(other);
+            public override int GetHashCode() => Value.GetHashCode();
+            public static bool operator ==(NetworkableId left, NetworkableId right) => left.Equals(right);
+            public static bool operator !=(NetworkableId left, NetworkableId right) => !left.Equals(right);
+            public override string ToString() => Value.ToString("G");
+        }
+
+        public struct Packet
+        {
+            public bool IsValid => Size > 0;
+            public long Position { get; set; }
+            public int Size { get; set; }
+            public long Time { get; set; }
+            public byte[] Data { get; set; }
+
+            public Packet(long position, int size, long time, byte[] data)
+            {
+                Position = position;
+                Size = size;
+                Time = time;
+                Data = data;
+            }
+        }
+
+        #endregion
+
+        #region Data Models
+
+        public class BaseNetworkable
+        {
+            public NetworkableId uid { get; set; }
+            public uint prefabId { get; set; }
+        }
+
+        public class BaseEntity
+        {
+            public NetworkableId uid { get; set; }
+            public uint prefabId { get; set; }
+            public Vector3? position { get; set; }
+            public Vector3? rotation { get; set; }
+            public ulong ownerId { get; set; }
+            public uint flags { get; set; }
+        }
+
+        public class BasePlayer
+        {
+            public NetworkableId uid { get; set; }
+            public uint prefabId { get; set; }
+            public Vector3? position { get; set; }
+            public Vector3? rotation { get; set; }
+            public string name { get; set; } = string.Empty;
+            public ulong userId { get; set; }
+            public uint health { get; set; }
+            public uint maxHealth { get; set; }
+        }
+
+        public class Entity
+        {
+            public BaseNetworkable? baseNetworkable { get; set; }
+            public BaseEntity? baseEntity { get; set; }
+            public BasePlayer? basePlayer { get; set; }
+        }
+
+        public class EntityPositionUpdate
+        {
+            public NetworkableId EntityId { get; set; }
+            public Vector3? Position { get; set; }
+            public Vector3? Rotation { get; set; }
+        }
+
+        public class EntityDestroyEvent
+        {
+            public NetworkableId EntityId { get; set; }
+        }
+
+        public class RPCMessageData
+        {
+            public NetworkableId TargetEntity { get; set; }
+            public uint RPCId { get; set; }
+            public byte[] Data { get; set; } = Array.Empty<byte>();
+        }
+
+        public class VoiceDataInfo
+        {
+            public NetworkableId PlayerId { get; set; }
+            public byte[] AudioData { get; set; } = Array.Empty<byte>();
+        }
+
+        public class EffectData
+        {
+            public string EffectName { get; set; } = string.Empty;
+            public Vector3? Position { get; set; }
+            public Vector3? Direction { get; set; }
+            public uint EntityId { get; set; }
+        }
+
+        #endregion
+
+        #region Event Args
+
+        public class EntityEventArgs : EventArgs
+        {
+            public Entity Entity { get; set; } = new();
+        }
+
+        public class PositionUpdateEventArgs : EventArgs
+        {
+            public NetworkableId EntityId { get; set; }
+            public Vector3? Position { get; set; }
+            public Vector3? Rotation { get; set; }
+        }
+
+        public class EntityDestroyEventArgs : EventArgs
+        {
+            public NetworkableId EntityId { get; set; }
+        }
+
+        public class RPCMessageEventArgs : EventArgs
+        {
+            public NetworkableId TargetEntity { get; set; }
+            public uint RPCId { get; set; }
+            public byte[] Data { get; set; } = Array.Empty<byte>();
+        }
+
+        public class VoiceDataEventArgs : EventArgs
+        {
+            public NetworkableId PlayerId { get; set; }
+            public byte[] AudioData { get; set; } = Array.Empty<byte>();
+        }
+
+        public class EffectEventArgs : EventArgs
+        {
+            public string EffectName { get; set; } = string.Empty;
+            public Vector3? Position { get; set; }
+            public Vector3? Direction { get; set; }
+            public uint EntityId { get; set; }
+        }
+
+        public class EntityFlagsEventArgs : EventArgs
+        {
+            public NetworkableId EntityId { get; set; }
+            public uint Flags { get; set; }
+        }
+
+        #endregion
+
+        #region Packet.Handler
+
+        public class PacketHandler : IDisposable
+        {
+            private long _packetCount;
+            private long _lastPacketTime;
+            private readonly Dictionary<NetworkableId, Entity> _entities = new();
+            private readonly HashSet<NetworkableId> _updatedEntities = new();
+
+            public long PacketCount => _packetCount;
+
+            public long LastPacketTime => _lastPacketTime;
+
+            public IReadOnlyDictionary<NetworkableId, Entity> Entities => _entities;
+
+            #region Events
+
+            public event EventHandler<EntityEventArgs>? EntityReceived;
+            public event EventHandler<PositionUpdateEventArgs>? EntityPositionUpdated;
+            public event EventHandler<EntityDestroyEventArgs>? EntityDestroyed;
+            public event EventHandler<RPCMessageEventArgs>? RPCMessageReceived;
+            public event EventHandler<VoiceDataEventArgs>? VoiceDataReceived;
+            public event EventHandler<EffectEventArgs>? EffectReceived;
+            public event EventHandler<EntityFlagsEventArgs>? EntityFlagsUpdated;
+            public event EventHandler<(MessageType Type, byte[] Data)>? UnknownPacketReceived;
+
+            #endregion
+
+            public Packet? ReadPacket(Stream stream)
+            {
+                try
+                {
+                    if (stream.Position >= stream.Length)
+                        return null;
+
+                    long position = ReadInt64(stream);
+                    int size = ReadInt32(stream);
+                    long time = ReadInt64(stream);
+
+                    if (size <= 0 || size > 10_000_000)
+                        return null;
+
+                    byte[] data = new byte[size];
+                    int bytesRead = 0;
+                    while (bytesRead < size)
+                    {
+                        int read = stream.Read(data, bytesRead, size - bytesRead);
+                        if (read == 0)
+                            return null;
+                        bytesRead += read;
+                    }
+
+                    return new Packet(position, size, time, data);
+                }
+                catch (EndOfStreamException)
+                {
+                    return null;
+                }
+            }
+
+            public void ProcessPacket(Packet packet)
+            {
+                _packetCount++;
+                _lastPacketTime = Math.Max(_lastPacketTime, packet.Time);
+
+                using var stream = new MemoryStream(packet.Data);
+                using var reader = new BinaryReader(stream);
+
+                if (stream.Position >= stream.Length)
+                    return;
+
+                byte typeByte = reader.ReadByte();
+
+                if (typeByte > 140)
+                {
+                    typeByte -= 140;
+
+                    if (typeByte <= 28)
+                    {
+                        switch (typeByte)
+                        {
+                            case 5:
+                                ReadEntities(reader);
+                                break;
+                            case 6:
+                                ReadEntityDestroy(reader);
+                                break;
+                            case 9:
+                                ReadRPCMessage(reader);
+                                break;
+                            case 10:
+                                ReadEntityPosition(reader);
+                                break;
+                            default:
+                                UnknownPacketReceived?.Invoke(this, ((MessageType)typeByte, packet.Data));
+                                break;
+                        }
+                    }
+                }
+            }
+
+            public void HandleNetworkPacket(MessageType type, byte[] packet, string wipeId)
+            {
+                _packetCount++;
+                switch (type)
+                {
+                    case MessageType.Entities:
+                       HandleEntities(packet, wipeId);
+                        break;
+
+                    case MessageType.EntityPosition:
+                       HandleEntityPosition(packet, wipeId);
+                        break;
+
+                    case MessageType.EntityDestroy:
+                       HandleEntityDestroy(packet, wipeId);
+                        break;
+
+                    case MessageType.RPCMessage:
+                         HandleRPCMessage(packet, wipeId);
+                        break;
+
+                    case MessageType.VoiceData:
+                        HandleVoiceData(packet, wipeId);
+                        break;
+
+                    case MessageType.Effect:
+                          HandleEffect(packet, wipeId);
+                        break;
+
+                    case MessageType.EntityFlags:
+                        HandleEntityFlags(packet, wipeId);
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+
+            #region Handlers
+
+            private void HandleEntities(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                while (stream.Position < stream.Length - 1)
+                {
+                    long startPos = stream.Position;
+                    byte firstByte = reader.ReadByte();
+                    if (firstByte == 0x08 || firstByte == 0x10 || firstByte == 0x09 || firstByte == 0x11)
+                    {
+                        stream.Position = startPos;
+                        break;
+                    }
+                }
+                var entity = ReadEntity(reader);
+                if (entity?.baseNetworkable != null)
+                {
+                    var entityId = entity.baseNetworkable.uid;
+                    MarkEntityUpdated(entityId);
+                    _entities[entityId] = entity;
+                    EntityReceived?.Invoke(this, new EntityEventArgs { Entity = entity });
+                }
+            }
+
+            private void HandleEntityPosition(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                var entityId = new NetworkableId(reader.ReadUInt64());
+                var position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                var rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                MarkEntityUpdated(entityId);
+                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
+                {
+                    entity.baseEntity.position = position;
+                    entity.baseEntity.rotation = rotation;
+                }
+                EntityPositionUpdated?.Invoke(this, new PositionUpdateEventArgs
+                {
+                    EntityId = entityId,
+                    Position = position,
+                    Rotation = rotation
+                });
+            }
+
+            private void HandleEntityDestroy(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                var entityId = new NetworkableId(reader.ReadUInt64());
+                _entities.Remove(entityId);
+                MarkEntityUpdated(entityId);
+                EntityDestroyed?.Invoke(this, new EntityDestroyEventArgs { EntityId = entityId });
+            }
+
+            private void HandleRPCMessage(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                var targetEntity = new NetworkableId(reader.ReadUInt64());
+                var rpcId = reader.ReadUInt32();
+                var data = reader.ReadBytes((int)(stream.Length - stream.Position));
+                RPCMessageReceived?.Invoke(this, new RPCMessageEventArgs
+                {
+                    TargetEntity = targetEntity,
+                    RPCId = rpcId,
+                    Data = data
+                });
+            }
+
+            private void HandleVoiceData(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                var playerId = new NetworkableId(reader.ReadUInt64());
+                var audioData = reader.ReadBytes((int)(stream.Length - stream.Position));
+                VoiceDataReceived?.Invoke(this, new VoiceDataEventArgs
+                {
+                    PlayerId = playerId,
+                    AudioData = audioData
+                });
+            }
+
+            private void HandleEffect(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                string effectName = string.Empty;
+                Vector3 position = Vector3.Zero;
+                Vector3 direction = Vector3.Zero;
+                uint entityId = 0;
+                try
+                {
+                    if (stream.Position < stream.Length)
+                    {
+                        int nameLength = reader.ReadByte();
+                        if (nameLength > 0 && stream.Position + nameLength <= stream.Length)
+                        {
+                            byte[] nameBytes = reader.ReadBytes(nameLength);
+                            effectName = Encoding.UTF8.GetString(nameBytes);
+                        }
+                    }
+                    if (stream.Position + 12 <= stream.Length)
+                    {
+                        position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                    }
+                    if (stream.Position + 12 <= stream.Length)
+                    {
+                        direction = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                    }
+                    if (stream.Position < stream.Length)
+                    {
+                        entityId = ReadVarUInt32(reader);
+                    }
+                }
+                catch { /* Parsing failed */ }
+
+                EffectReceived?.Invoke(this, new EffectEventArgs
+                {
+                    EffectName = effectName,
+                    Position = position,
+                    Direction = direction,
+                    EntityId = entityId
+                });
+            }
+
+            private void HandleEntityFlags(byte[] packet, string wipeId)
+            {
+                using var stream = new MemoryStream(packet);
+                using var reader = new BinaryReader(stream);
+                var entityId = new NetworkableId(reader.ReadUInt64());
+                var flags = reader.ReadUInt32();
+                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
+                {
+                    entity.baseEntity.flags = flags;
+                }
+                EntityFlagsUpdated?.Invoke(this, new EntityFlagsEventArgs
+                {
+                    EntityId = entityId,
+                    Flags = flags
+                });
+            }
+
+            #endregion
+
+            #region Internal.Readers
+
+            private void ReadEntities(BinaryReader reader)
+            {
+                var stream = reader.BaseStream;
+                if (stream.Position >= stream.Length){ return; }
+
+                reader.ReadUInt32(); 
+                var entity = ReadEntity(reader);
+                if (entity?.baseNetworkable != null)
+                {
+                    var entityId = entity.baseNetworkable.uid;
+                    MarkEntityUpdated(entityId);
+                    _entities[entityId] = entity;
+                    EntityReceived?.Invoke(this, new EntityEventArgs { Entity = entity });
+                }
+            }
+
+            private void ReadEntityDestroy(BinaryReader reader)
+            {
+                var entityId = new NetworkableId(reader.ReadUInt32());
+                _entities.Remove(entityId);
+                MarkEntityUpdated(entityId);
+                EntityDestroyed?.Invoke(this, new EntityDestroyEventArgs { EntityId = entityId });
+            }
+
+            private void ReadEntityPosition(BinaryReader reader)
+            {
+                var entityId = new NetworkableId(reader.ReadUInt64());
+                var position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                var rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+
+                MarkEntityUpdated(entityId);
+
+                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
+                {
+                    entity.baseEntity.position = position;
+                    entity.baseEntity.rotation = rotation;
+                }
+
+                EntityPositionUpdated?.Invoke(this, new PositionUpdateEventArgs
+                {
+                    EntityId = entityId,
+                    Position = position,
+                    Rotation = rotation
+                });
+            }
+
+            private void ReadRPCMessage(BinaryReader reader)
+            {
+                var data = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
+                RPCMessageReceived?.Invoke(this, new RPCMessageEventArgs { Data = data });
+            }
+
+            private Entity? ReadEntity(BinaryReader reader)
+            {
+                var entity = new Entity();
+
+                try
+                {
+                    entity.baseNetworkable = ReadBaseNetworkable(reader);
+                }
+                catch
+                {
+                    // Entity parsing incomplete, return what we have
+                }
+
+                return entity;
+            }
+
+            private BaseNetworkable? ReadBaseNetworkable(BinaryReader reader)
+            {
+                var result = new BaseNetworkable();
+                var stream = reader.BaseStream;
+
+                while (stream.Position < stream.Length)
+                {
+                    byte tag = reader.ReadByte();
+                    int fieldNumber = tag >> 3;
+                    int wireType = tag & 0x07;
+
+                    switch (fieldNumber)
+                    {
+                        case 1: // uid
+                            if (wireType == 0)
+                                result.uid = new NetworkableId(ReadVarUInt64(reader));
+                            break;
+                        case 2: // prefabId
+                            if (wireType == 0)
+                                result.prefabId = ReadVarUInt32(reader);
+                            break;
+                        default:
+                            SkipField(reader, wireType);
+                            break;
+                    }
+                }
+
+                return result;
+            }
+
+            private void MarkEntityUpdated(NetworkableId entityId)
+            {
+                _updatedEntities.Add(entityId);
+            }
+
+            #endregion
+
+            #region Binary.Helpers
+
+            private static long ReadInt64(Stream stream)
+            {
+                byte[] buffer = new byte[8];
+                stream.Read(buffer, 0, 8);
+                if (BitConverter.IsLittleEndian)
+                    Array.Reverse(buffer);
+                return BitConverter.ToInt64(buffer, 0);
+            }
+
+            private static int ReadInt32(Stream stream)
+            {
+                byte[] buffer = new byte[4];
+                stream.Read(buffer, 0, 4);
+                if (BitConverter.IsLittleEndian)
+                    Array.Reverse(buffer);
+                return BitConverter.ToInt32(buffer, 0);
+            }
+
+            private static ulong ReadVarUInt64(BinaryReader reader)
+            {
+                ulong result = 0;
+                int shift = 0;
+                while (shift < 64)
+                {
+                    byte b = reader.ReadByte();
+                    result |= (ulong)(b & 0x7F) << shift;
+                    shift += 7;
+                    if ((b & 0x80) == 0){ break; }
+                }
+                return result;
+            }
+
+            private static uint ReadVarUInt32(BinaryReader reader)
+            {
+                uint result = 0;
+                int shift = 0;
+                while (shift < 32)
+                {
+                    byte b = reader.ReadByte();
+                    result |= (uint)(b & 0x7F) << shift;
+                    shift += 7;
+                    if ((b & 0x80) == 0){ break; }
+                }
+
+                return result;
+            }
+
+            private static void SkipField(BinaryReader reader, int wireType)
+            {
+                switch (wireType)
+                {
+                    case 0: 
+                        reader.ReadByte();
+                        break;
+                    case 1:
+                        reader.ReadBytes(8);
+                        break;
+                    case 2:
+                        int len = (int)ReadVarUInt32(reader);
+                        reader.ReadBytes(len);
+                        break;
+                    case 5:
+                        reader.ReadBytes(4);
+                        break;
+                }
+            }
+
+            #endregion
+
+            public void Dispose()
+            {
+            }
+        }
+
+        #endregion
+
+        #region Static.Helper.Methods
+        public static PacketHandler CreateHandler(
+            Action<EntityEventArgs>? onEntity = null,
+            Action<PositionUpdateEventArgs>? onPositionUpdate = null,
+            Action<EntityDestroyEventArgs>? onEntityDestroy = null,
+            Action<RPCMessageEventArgs>? onRPC = null,
+            Action<VoiceDataEventArgs>? onVoice = null,
+            Action<EffectEventArgs>? onEffect = null,
+            Action<EntityFlagsEventArgs>? onEntityFlags = null)
+        {
+            var handler = new PacketHandler();
+            if (onEntity != null) handler.EntityReceived += (s, e) => onEntity(e);
+            if (onPositionUpdate != null) handler.EntityPositionUpdated += (s, e) => onPositionUpdate(e);
+            if (onEntityDestroy != null) handler.EntityDestroyed += (s, e) => onEntityDestroy(e);
+            if (onRPC != null) handler.RPCMessageReceived += (s, e) => onRPC(e);
+            if (onVoice != null) handler.VoiceDataReceived += (s, e) => onVoice(e);
+            if (onEffect != null) handler.EffectReceived += (s, e) => onEffect(e);
+            if (onEntityFlags != null) handler.EntityFlagsUpdated += (s, e) => onEntityFlags(e);
+            return handler;
+        }
+
+        #endregion
     }
 
     public class ServerInfo
     {
-        public string wipeId;
+        public string? wipeId;
         public DateTime connectedAt;
         public DateTime lastActivity;
         public long packetsReceived;
@@ -2023,61 +2726,7 @@ namespace RustRelayReceiver
         public List<string> pathNames = new List<string>();
         public List<object> customMonuments = new List<object>();
         public long timestamp;
-        public string png;
-    }
-    #endregion
-
-    #region Networking
-    namespace ProtoBuf
-    {
-        [ProtoContract]
-        public class Entity
-        {
-            [ProtoMember(1)]
-            public BaseEntity baseEntity { get; set; }
-
-            [ProtoMember(2)]
-            public BaseNetworkable baseNetworkable { get; set; }
-        }
-
-        [ProtoContract]
-        public class BaseNetworkable
-        {
-            [ProtoMember(1)]
-            public string prefabName { get; set; }
-
-            [ProtoMember(2)]
-            public uint netID { get; set; }
-        }
-
-        [ProtoContract]
-        public class BaseEntity
-        {
-            [ProtoMember(1)]
-            public ulong OwnerID { get; set; }
-
-            [ProtoMember(2)]
-            public Vector position { get; set; }
-
-            [ProtoMember(3)]
-            public Vector rotation { get; set; }
-
-            [ProtoMember(4)]
-            public string displayName { get; set; }
-        }
-
-        [ProtoContract]
-        public class Vector
-        {
-            [ProtoMember(1)]
-            public float x { get; set; }
-
-            [ProtoMember(2)]
-            public float y { get; set; }
-
-            [ProtoMember(3)]
-            public float z { get; set; }
-        }
+        public string? png;
     }
     #endregion
 
@@ -2091,7 +2740,7 @@ namespace RustRelayReceiver
             Version = 10U;
             Timestamp = 0L;
         }
-        public MapData GetMap(string name)
+        public MapData? GetMap(string name)
         {
             for (int i = 0; i < world.maps.Count; i++)
             {
@@ -2114,7 +2763,7 @@ namespace RustRelayReceiver
 
         public IEnumerable<PathData> GetPaths(string name) { return world.paths.Where((PathData p) => p.name.Contains(name)); }
 
-        public PathData GetPath(string name)
+        public PathData? GetPath(string name)
         {
             for (int i = 0; i < world.paths.Count; i++) { if (world.paths[i].name == name) { return world.paths[i]; } }
             return null;
@@ -2151,14 +2800,14 @@ namespace RustRelayReceiver
                             }
                             catch
                             {
-                                Console.WriteLine("Failed to deserialize map. Falling back to ProtoBuf.Deserialize");
+                                Program.LogDebug("Failed to deserialize map. Falling back to ProtoBuf.Deserialize");
                                 world = OldSerialization.Deserialize(lz4Stream);
                             }
                         }
                     }
                 }
             }
-            catch (Exception ex) { RustRelayReceiver.Program.LogDebug(ex.Message); }
+            catch (Exception ex) { Program.LogDebug(ex.Message); }
         }
 
         public WorldData world = new WorldData();
@@ -2171,13 +2820,13 @@ namespace RustRelayReceiver
             public uint size = 4000U;
 
             [ProtoMember(2)]
-            public string name;
+            public string? name;
 
             [ProtoMember(3)]
-            public byte[] data;
+            public byte[]? data;
 
             [ProtoMember(4)]
-            public int res;
+            public int? res;
         }
     }
 
@@ -2188,10 +2837,10 @@ namespace RustRelayReceiver
         public class MapData
         {
             [ProtoMember(1)]
-            public string name;
+            public string? name;
 
             [ProtoMember(2)]
-            public byte[] data;
+            public byte[]? data;
         }
 
         [ProtoContract]
@@ -2273,7 +2922,7 @@ namespace RustRelayReceiver
         public class PrefabData
         {
             [ProtoMember(1)]
-            public string category;
+            public string? category;
 
             [ProtoMember(2)]
             public uint id;
@@ -2290,16 +2939,28 @@ namespace RustRelayReceiver
 
         public class Vector3
         {
-            public float x;
-            public float y;
-            public float z;
+            public float X { get; set; }
+            public float Y { get; set; }
+            public float Z { get; set; }
 
             public Vector3(float x, float y, float z)
             {
-                this.x = x;
-                this.y = y;
-                this.z = z;
+                X = x;
+                Y = y;
+                Z = z;
             }
+
+            public static Vector3 Zero => new(0, 0, 0);
+
+            public float LengthSquared => X * X + Y * Y + Z * Z;
+            public float Length => MathF.Sqrt(LengthSquared);
+
+            public static Vector3 operator +(Vector3 a, Vector3 b) => new(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
+            public static Vector3 operator -(Vector3 a, Vector3 b) => new(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
+            public static Vector3 operator *(Vector3 a, float scalar) => new(a.X * scalar, a.Y * scalar, a.Z * scalar);
+            public static Vector3 operator /(Vector3 a, float scalar) => new(a.X / scalar, a.Y / scalar, a.Z / scalar);
+
+            public override string ToString() => $"({X:F2}, {Y:F2}, {Z:F2})";
         }
 
         public class Quaternion
@@ -2331,7 +2992,7 @@ namespace RustRelayReceiver
 
             public static implicit operator VectorData(Vector3 v)
             {
-                return new VectorData(v.x, v.y, v.z);
+                return new VectorData(v.X, v.Y, v.Z);
             }
 
             public static implicit operator VectorData(Quaternion q)
@@ -2486,7 +3147,7 @@ namespace RustRelayReceiver
             River = 16384,
         }
 
-        public byte[] Render()
+        public byte[]? Render()
         {
             if (Topology == null || Splat == null) return null;
             var config = new Config();
