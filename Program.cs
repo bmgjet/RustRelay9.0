@@ -25,6 +25,7 @@ namespace RustRelayReceiver
     class Program
     {
         // Configuration
+        public static string Version = "RustRelay9.0 V001";
         private static string _baseUrl = "http://localhost:8080";
         private static string _authToken = "demotoken";
         private static readonly HttpListener _httpListener = new HttpListener();
@@ -53,7 +54,7 @@ namespace RustRelayReceiver
         {
             PrintStatistics();
             ParseArguments(args);
-            LogDebug($"Starting relay server on {_baseUrl}");
+            LogDebug($"Starting {Version} relay server on {_baseUrl}");
             StartHttpListener();
             Task.Run(async () =>
             {
@@ -128,7 +129,7 @@ namespace RustRelayReceiver
                 try { resp.Close(); } catch { }
             }
         }
-   
+
         private static void OnStringPoolReceived(string? wipeId, Dictionary<uint, string> stringPool)
         {
             SaveStringPoolToFile(wipeId, stringPool);
@@ -146,7 +147,7 @@ namespace RustRelayReceiver
 
         private static void OnMapFileReceived(string? wipeId, string filename, byte[] data)
         {
-            if(wipeId == null) { return; }
+            if (wipeId == null) { return; }
             SaveMapFileToDirectory(wipeId, filename, data);
             LogDebug($"[MapFile] {filename}");
         }
@@ -173,7 +174,7 @@ namespace RustRelayReceiver
 
         private static void OnRPCMessageReceived(object? sender, uint ID, NetworkableId netid, byte[] data)
         {
-         //   LogDebug($"RPCMessage: ID={ID}");
+            //   LogDebug($"RPCMessage: ID={ID}");
         }
 
         private static void OnVoiceDataReceived(object? sender, NetworkableId playerid, byte[] voicedata)
@@ -200,8 +201,8 @@ namespace RustRelayReceiver
             {
                 string? serverid = context.Request.Headers["X-Wipe-Id"];
                 if (!string.IsNullOrEmpty(serverid)) { CreateDirectories(serverid); }
-                if (context.Request.IsWebSocketRequest){ await HandleWebSocketRequest(context); }
-                else { _ = Task.Run(() => HandleHttpRequest(context));  }
+                if (context.Request.IsWebSocketRequest) { await HandleWebSocketRequest(context); }
+                else { _ = Task.Run(() => HandleHttpRequest(context)); }
             }
             catch (Exception ex)
             {
@@ -470,7 +471,7 @@ namespace RustRelayReceiver
             }
             response.Close();
         }
-        
+
         private static void ProcessBinaryPacket(byte[]? buffer, int length, string? wipeId)
         {
             Interlocked.Increment(ref _totalPacketsReceived);
@@ -492,10 +493,10 @@ namespace RustRelayReceiver
             MessageType type = (MessageType)(packetId - 140);
             //HandleNetworkPacket(type, span, wipeId);
         }
-        
+
         private static async Task HandleModels(HttpListenerContext ctx)
         {
-            if(ctx.Request.Url == null) { return; }
+            if (ctx.Request.Url == null) { return; }
             if (!ctx.Request.Url.AbsolutePath.StartsWith("/models/", StringComparison.OrdinalIgnoreCase)) { return; }
             string rawFileName = ctx.Request.Url.AbsolutePath.Substring("/models/".Length);
             if (rawFileName.Contains('?')) { rawFileName = rawFileName.Split('?')[0]; }
@@ -524,7 +525,8 @@ namespace RustRelayReceiver
                 case ".json": contentType = "application/json"; break;
                 case ".bin": contentType = "application/octet-stream"; break;
                 default: contentType = "application/octet-stream"; break;
-            };
+            }
+            ;
             try
             {
                 byte[] fileBytes = File.ReadAllBytes(fullPath);
@@ -560,9 +562,9 @@ namespace RustRelayReceiver
             if (wipeId == null) { return; }
             PacketHandler _handler = CreateHandler(
                 onEntity: e => OnEntityReceived(wipeId, e.Entity),
-                onPositionUpdate: e => OnEntityPositionUpdated(wipeId, e.EntityId,e.Position,e.Rotation),
-                onEntityDestroy: e => OnEntityDestroyed(wipeId,e.EntityId),
-                onRPC: e => OnRPCMessageReceived(wipeId, e.RPCId,e.TargetEntity,e.Data),
+                onPositionUpdate: e => OnEntityPositionUpdated(wipeId, e.EntityId, e.Position, e.Rotation),
+                onEntityDestroy: e => OnEntityDestroyed(wipeId, e.EntityId),
+                onRPC: e => OnRPCMessageReceived(wipeId, e.RPCId, e.TargetEntity, e.Data),
                 onEffect: e => OnEffectReceived(wipeId, e.EffectName, e.Position, e.Direction, e.EntityId),
                 onEntityFlags: e => OnEntityFlagsUpdated(wipeId, e.EntityId, e.Flags),
                 onVoice: e => OnVoiceDataReceived(wipeId, e.PlayerId, e.AudioData)
@@ -915,7 +917,7 @@ namespace RustRelayReceiver
                 return;
             }
             string? wipeId = parts?[0];
-            if(wipeId == null) { return; }
+            if (wipeId == null) { return; }
             string? fileType = parts?[1];
             string? filename = parts?.Length > 2 ? Uri.UnescapeDataString(string.Join("/", parts.Skip(2))) : "";
             try
@@ -1098,7 +1100,7 @@ namespace RustRelayReceiver
                     if (mapData?.data != null)
                     {
                         heightBytes = DownsampleMap(mapData.data, 2);
-                        if(heightBytes == null) { return; }
+                        if (heightBytes == null) { return; }
                         heightRes = (int)Math.Sqrt(heightBytes.Length / 2);
                     }
                     mapData = worldSerialization.GetMap("splat");
@@ -1220,7 +1222,7 @@ namespace RustRelayReceiver
         {
             try
             {
-                if(EncryptedData == null) { return string.Empty; }
+                if (EncryptedData == null) { return string.Empty; }
                 using (var aes = Aes.Create())
                 {
                     var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), new byte[] { 73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118 });
@@ -1425,9 +1427,9 @@ namespace RustRelayReceiver
                 WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
                 if (worldSerialization == null) { return mapInfo; }
                 byte[]? tempdata = worldSerialization.GetMap("topology")?.data;
-                if(tempdata == null) { return null; }
+                if (tempdata == null) { return null; }
                 int[]? Topology = new int[tempdata.Length];
-                   Buffer.BlockCopy(tempdata, 0, Topology, 0, Topology.Length);
+                Buffer.BlockCopy(tempdata, 0, Topology, 0, Topology.Length);
                 MapRender? mapRender = new MapRender(worldSerialization?.GetMap("splat")?.data, Topology);
                 mapInfo.png = CompressAndEncode(mapRender.Render());
                 mapInfo.worldsize = (int)worldSerialization.world.size;
@@ -1455,6 +1457,7 @@ namespace RustRelayReceiver
                     });
                 }
                 LogDebug($"[MAP INFO] Loaded - Maps: {mapInfo.mapCount}, Prefabs: {mapInfo.prefabCount}, Paths: {mapInfo.pathCount}, Monuments: {mapInfo.customMonumentCount}");
+                if (mapInfo.worldsize > 8000 || mapInfo.worldsize < 300) { mapInfo.worldsize = 8000; }
             }
             catch (Exception ex) { LogDebug($"[MAP INFO] Error loading map info: {ex.Message}"); }
             return mapInfo;
@@ -1498,32 +1501,34 @@ namespace RustRelayReceiver
             {
                 DateTime now = DateTime.UtcNow;
                 int row = 0;
-                Console.SetCursorPosition(0, row++);
-                string globalLine = $"[STATS] Uptime: {GetUptimeSeconds():F0}s | WebSockets: {_webSocketClients.Count} | Packets: {Interlocked.Read(ref _totalPacketsReceived)}";
-                Console.Write(globalLine.PadRight(Console.WindowWidth));
+
+                MoveCursor(row++);
+                ClearLine();
+                Console.Write($"[STATS] Uptime: {GetUptimeSeconds():F0}s | WebSockets: {_webSocketClients.Count} | Packets: {Interlocked.Read(ref _totalPacketsReceived)}");
+
                 lock (_serversLock)
                 {
                     foreach (var server in _connectedServers)
                     {
-                        Console.SetCursorPosition(0, row++);
+                        MoveCursor(row++);
+                        ClearLine();
+
                         string connectedStr = FormatReadableTime(now - server.connectedAt);
                         string activeStr = FormatReadableTime(now - server.lastActivity);
-                        string serverLine = $"[Server] ID: {server.wipeId} | Up: {connectedStr} | Active: {activeStr} | Data: {FormatBytes(server.bytesReceived)}";
-                        Console.Write(serverLine.PadRight(Console.WindowWidth - 1));
+
+                        Console.Write($"[Server] ID: {server.wipeId} | Up: {connectedStr} | Active: {activeStr} | Data: {FormatBytes(server.bytesReceived)}");
                     }
                 }
-                Console.SetCursorPosition(0, row++);
-                Console.Write("".PadRight(Console.WindowWidth - 1));
-                int newHeight = row;
-                if (_headerHeight > newHeight)
+
+                // Clear any leftover old header lines
+                for (int i = row; i < _headerHeight; i++)
                 {
-                    for (int i = newHeight; i <= _headerHeight; i++)
-                    {
-                        Console.SetCursorPosition(0, i);
-                        Console.Write("".PadRight(Console.WindowWidth - 1));
-                    }
+                    MoveCursor(i);
+                    ClearLine();
                 }
-                _headerHeight = newHeight;
+
+                _headerHeight = row + 2;
+                MoveCursor(_headerHeight);
             }
         }
 
@@ -1531,9 +1536,20 @@ namespace RustRelayReceiver
         {
             lock (_consoleLock)
             {
-                if (Console.CursorTop < _headerHeight) { Console.SetCursorPosition(0, _headerHeight); }
+                MoveCursor(_headerHeight);
+                ClearLine();
                 Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
             }
+        }
+
+        private static void ClearLine()
+        {
+            Console.Write("\x1b[2K");
+        }
+
+        private static void MoveCursor(int row, int col = 0)
+        {
+            Console.Write($"\x1b[{row + 1};{col + 1}H");
         }
 
         private static string FormatReadableTime(TimeSpan ts)
@@ -1678,7 +1694,7 @@ namespace RustRelayReceiver
 
         private static void LoadWipeStringToGlobalPool(string? wipeId)
         {
-            if(wipeId == null) return;
+            if (wipeId == null) return;
             string stringPoolsDir = Path.Combine(DataDirectory, wipeId, "StringPools");
             if (!Directory.Exists(stringPoolsDir)) return;
             var latestFile = Directory.GetFiles(stringPoolsDir, "*.json").Select(f => new FileInfo(f)).OrderByDescending(f => f.LastWriteTimeUtc).FirstOrDefault();
@@ -1869,7 +1885,7 @@ namespace RustRelayReceiver
             try
             {
                 string filename = $"stringpool.json";
-                if(wipeId == null) { return; }
+                if (wipeId == null) { return; }
                 string filepath = Path.Combine(DataDirectory, wipeId, "StringPools", SanitizeFilename(filename));
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
@@ -1893,7 +1909,7 @@ namespace RustRelayReceiver
             try
             {
                 string filename = $"manifest.json";
-                if(wipeId == null) { return; }
+                if (wipeId == null) { return; }
                 string filepath = Path.Combine(DataDirectory, wipeId, "Manifests", SanitizeFilename(filename));
                 var sb = new StringBuilder();
                 sb.AppendLine("{");
@@ -1916,7 +1932,7 @@ namespace RustRelayReceiver
         {
             try
             {
-                if(wipeId == null) { return ; }
+                if (wipeId == null) { return; }
                 string snapshotDir = Path.Combine(DataDirectory, wipeId, "Snapshots");
                 Directory.CreateDirectory(snapshotDir);
                 var existingFiles = new DirectoryInfo(snapshotDir).GetFiles("snapshot_*.sav").OrderByDescending(f => f.CreationTimeUtc).ToList();
@@ -1951,7 +1967,7 @@ namespace RustRelayReceiver
             if (s == null) { return ""; }
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
         }
-     #endregion
+        #endregion
     }
 
     #region Classes
@@ -2315,19 +2331,19 @@ namespace RustRelayReceiver
                 switch (type)
                 {
                     case MessageType.Entities:
-                       HandleEntities(packet, wipeId);
+                        HandleEntities(packet, wipeId);
                         break;
 
                     case MessageType.EntityPosition:
-                       HandleEntityPosition(packet, wipeId);
+                        HandleEntityPosition(packet, wipeId);
                         break;
 
                     case MessageType.EntityDestroy:
-                       HandleEntityDestroy(packet, wipeId);
+                        HandleEntityDestroy(packet, wipeId);
                         break;
 
                     case MessageType.RPCMessage:
-                         HandleRPCMessage(packet, wipeId);
+                        HandleRPCMessage(packet, wipeId);
                         break;
 
                     case MessageType.VoiceData:
@@ -2335,7 +2351,7 @@ namespace RustRelayReceiver
                         break;
 
                     case MessageType.Effect:
-                          HandleEffect(packet, wipeId);
+                        HandleEffect(packet, wipeId);
                         break;
 
                     case MessageType.EntityFlags:
@@ -2499,9 +2515,9 @@ namespace RustRelayReceiver
             private void ReadEntities(BinaryReader reader)
             {
                 var stream = reader.BaseStream;
-                if (stream.Position >= stream.Length){ return; }
+                if (stream.Position >= stream.Length) { return; }
 
-                reader.ReadUInt32(); 
+                reader.ReadUInt32();
                 var entity = ReadEntity(reader);
                 if (entity?.baseNetworkable != null)
                 {
@@ -2630,7 +2646,7 @@ namespace RustRelayReceiver
                     byte b = reader.ReadByte();
                     result |= (ulong)(b & 0x7F) << shift;
                     shift += 7;
-                    if ((b & 0x80) == 0){ break; }
+                    if ((b & 0x80) == 0) { break; }
                 }
                 return result;
             }
@@ -2644,7 +2660,7 @@ namespace RustRelayReceiver
                     byte b = reader.ReadByte();
                     result |= (uint)(b & 0x7F) << shift;
                     shift += 7;
-                    if ((b & 0x80) == 0){ break; }
+                    if ((b & 0x80) == 0) { break; }
                 }
 
                 return result;
@@ -2654,7 +2670,7 @@ namespace RustRelayReceiver
             {
                 switch (wireType)
                 {
-                    case 0: 
+                    case 0:
                         reader.ReadByte();
                         break;
                     case 1:
@@ -3272,7 +3288,6 @@ namespace RustRelayReceiver
     #region HTML Pages
     public static class HtmlStyles
     {
-
         public const string BackgroundPrimary = "#1a1a2e";
         public const string BackgroundSecondary = "#16213e";
         public const string BackgroundDark = "#0f0f23";
@@ -3287,257 +3302,403 @@ namespace RustRelayReceiver
         public const string BorderDefault = "#333";
 
         public static string GetBaseStyles() => @"
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: " + BackgroundPrimary + @";
-            color: " + TextPrimary + @";
-            min-height: 100vh;
-        }
-        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
-        h1 { color: " + AccentSecondary + @"; margin-bottom: 20px; }
-        h2 { color: " + AccentPrimary + @"; margin: 0 0 15px; }
-        h3 { color: " + AccentSecondary + @"; margin: 15px 0 10px; }
-        .card {
-            background: " + BackgroundSecondary + @";
-            border-radius: 10px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        .subtitle { color: " + TextMuted + @"; margin-bottom: 20px; }
-        .back-link { color: " + AccentPrimary + @"; text-decoration: none; margin-bottom: 20px; display: inline-block; }
-        .back-link:hover { text-decoration: underline; }
-        .login-form { max-width: 300px; margin: 100px auto; }
-        input[type=""password""], input[type=""text""] {
-            width: 100%;
-            padding: 12px;
-            border: 1px solid " + BorderDefault + @";
-            border-radius: 5px;
-            background: " + BackgroundDark + @";
-            color: " + TextPrimary + @";
-            margin-bottom: 10px;
-        }
-        button, .action-btn {
-            width: 100%;
-            padding: 12px;
-            background: " + AccentSecondary + @";
-            border: none;
-            border-radius: 5px;
-            color: #fff;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: bold;
-            transition: background 0.2s ease;
-        }
-        button:hover, .action-btn:hover { background: #ff5252; }
-        .error { color: " + AccentSecondary + @"; margin-top: 10px; display: none; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; table-layout: fixed; }
-        th, td { padding: 12px; text-align: left; border-bottom: 1px solid " + BorderDefault + @"; }
-        th { background: " + BackgroundDark + @"; color: " + AccentPrimary + @"; }
-        tr:hover { background: #1f3050; }
-        tr.clickable { cursor: pointer; }
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-        .wipe-id-col { width: 280px; min-width: 280px; }
-        .stat-box {
-            background: " + BackgroundDark + @";
-            padding: 15px;
-            border-radius: 8px;
-            text-align: center;
-        }
-        .stat-value { font-size: 24px; font-weight: bold; color: " + AccentPrimary + @"; }
-        .stat-label { font-size: 12px; color: " + TextSecondary + @"; margin-top: 5px; }
-        .refresh-btn { background: " + AccentPrimary + @"; color: #000; }
-        .refresh-btn:hover { background: #3dbdb5; }
-        .logout-btn { background: " + TextMuted + @"; margin-top: 20px; }
-        .logout-btn:hover { background: #555; }
-        .last-update { color: " + TextMuted + @"; font-size: 12px; margin-top: 10px; }
-        .badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            margin-right: 5px;
-        }
-        .badge-success { background: rgba(100, 200, 100, 0.2); color: " + Success + @"; }
-        .badge-warning { background: rgba(255, 193, 7, 0.2); color: " + Warning + @"; }
-        .badge-info { background: rgba(0, 217, 255, 0.2); color: " + AccentInfo + @"; }
-        .action-btn.secondary { background: " + TextMuted + @"; color: #fff; }
-        .action-btn.secondary:hover { background: #555; }
-        .action-buttons { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 15px; }
-        .loading { text-align: center; padding: 40px; color: " + TextSecondary + @"; }
-        .error-box {
-            background: rgba(255, 107, 107, 0.1);
-            border: 1px solid " + AccentSecondary + @";
-            border-radius: 8px;
-            padding: 15px;
-            color: " + AccentSecondary + @";
-        }
-        .info-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 10px;
-        }
-        .info-item { background: " + BackgroundDark + @"; padding: 12px; border-radius: 6px; }
-        .info-item .label { font-size: 11px; color: " + TextMuted + @"; text-transform: uppercase; }
-        .info-item .value { font-size: 14px; color: " + AccentPrimary + @"; margin-top: 4px; }
-        .clickable { cursor: pointer; }
-        .clickable:hover { opacity: 0.8; }
-        .badge.clickable:hover { background: rgba(0, 217, 255, 0.4); }
-        .detail-link { color: " + AccentPrimary + @"; text-decoration: none; font-size: 12px; }
-        .detail-link:hover { text-decoration: underline; }
-        .pos-cell { font-family: monospace; font-size: 11px; word-break: break-word; }
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.7);
-            z-index: 1000;
-        }
-        .modal.show { display: flex; align-items: center; justify-content: center; }
-        .modal-content {
-            background: " + BackgroundSecondary + @";
-            border-radius: 10px;
-            padding: 20px;
-            max-width: 1400px;
-            width: 95%;
-            max-height: 90vh;
-            overflow-y: auto;
-            overflow-x: hidden;
-        }
-        .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .modal-header h2 { margin: 0; }
-        .close-btn { background: none; border: none; color: " + AccentSecondary + @"; font-size: 24px; cursor: pointer; width: auto; padding: 0; }
-        .close-btn:hover { color: #ff5252; }
-        .pagination { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 15px; }
-        .pagination button {
-            padding: 8px 16px;
-            background: " + AccentPrimary + @";
-            border: none;
-            border-radius: 5px;
-            color: #000;
-            cursor: pointer;
-            width: auto;
-        }
-        .pagination button:disabled { background: " + TextMuted + @"; cursor: not-allowed; }
-        .pagination button:hover:not(:disabled) { background: #3dbdb5; }
-        .pagination span { color: " + TextSecondary + @"; }
-        .filter-bar { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
-        .filter-bar .badge { cursor: pointer; }
-        .filter-bar .badge.active { background: " + AccentPrimary + @"; color: #000; }
-        .download-link { color: " + AccentPrimary + @"; cursor: pointer; text-decoration: underline; }
-        .download-link:hover { color: #3dbdb5; }
-        .map-preview {
-            display: inline-block;
-            margin-bottom: 8px;
-            cursor: zoom-in;
-        }
-        .map-preview img {
-            max-width: 120px;
-            border-radius: 6px;
-            border: 2px solid " + AccentPrimary + @";
-            background: " + BackgroundDark + @";
-            transition: transform 0.15s ease;
-        }
-        .map-preview:hover img { transform: scale(1.03); }
-        .map-preview-overlay {
-            display: none;
-            position: fixed;
-            inset: 0;
-            background: rgba(0,0,0,0.85);
-            z-index: 2000;
-            align-items: center;
-            justify-content: center;
-        }
-        .map-preview-overlay img {
-            max-width: 95%;
-            max-height: 95%;
-            border-radius: 10px;
-            box-shadow: 0 0 40px rgba(0,0,0,0.6);
-        }
-        p { color: " + TextSecondary + @"; margin-bottom: 15px; }";
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: " + BackgroundPrimary + @";
+    color: " + TextPrimary + @";
+    min-height: 100vh;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+.container { max-width: 1400px; margin: 0 auto; padding: 12px; }
+@media (min-width: 768px) {
+    .container { padding: 20px; }
+}
+h1 { color: " + AccentSecondary + @"; margin-bottom: 16px; font-size: 1.5rem; }
+@media (min-width: 768px) { h1 { margin-bottom: 20px; font-size: 2rem; } }
+h2 { color: " + AccentPrimary + @"; margin: 0 0 12px; font-size: 1.25rem; }
+@media (min-width: 768px) { h2 { margin: 0 0 15px; font-size: 1.5rem; } }
+h3 { color: " + AccentSecondary + @"; margin: 12px 0 8px; font-size: 1rem; }
+@media (min-width: 768px) { h3 { margin: 15px 0 10px; } }
+.card {
+    background: " + BackgroundSecondary + @";
+    border-radius: 10px;
+    padding: 15px;
+    margin-bottom: 15px;
+}
+@media (min-width: 768px) { .card { padding: 20px; margin-bottom: 20px; } }
+.subtitle { color: " + TextMuted + @"; margin-bottom: 15px; font-size: 0.875rem; }
+.back-link { color: " + AccentPrimary + @"; text-decoration: none; margin-bottom: 15px; display: inline-block; }
+.back-link:hover { text-decoration: underline; }
+.login-form { max-width: 300px; margin: 60px auto; padding: 15px; }
+@media (min-width: 768px) { .login-form { margin: 100px auto; padding: 20px; } }
+input[type=""password""], input[type=""text""] {
+    width: 100%;
+    padding: 14px 12px;
+    border: 1px solid " + BorderDefault + @";
+    border-radius: 5px;
+    background: " + BackgroundDark + @";
+    color: " + TextPrimary + @";
+    margin-bottom: 10px;
+    font-size: 16px;
+    min-height: 48px;
+}
+button, .action-btn {
+    width: 100%;
+    padding: 14px 12px;
+    background: " + AccentSecondary + @";
+    border: none;
+    border-radius: 5px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: bold;
+    transition: background 0.2s ease;
+    min-height: 48px;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+button:hover, .action-btn:hover { background: #ff5252; }
+button:active, .action-btn:active { transform: scale(0.98); }
+.error { color: " + AccentSecondary + @"; margin-top: 10px; display: none; font-size: 14px; }
+.table-wrapper {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 0 -15px;
+    padding: 0 15px;
+}
+@media (min-width: 768px) { .table-wrapper { margin: 0; padding: 0; } }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th, td { padding: 10px 8px; text-align: left; border-bottom: 1px solid " + BorderDefault + @"; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (min-width: 768px) { th, td { padding: 12px; font-size: 14px; } }
+th { background: " + BackgroundDark + @"; color: " + AccentPrimary + @"; position: sticky; top: 0; }
+th.wipe-id-col { width: 340px; min-width: 340px; }
+td.wipe-id-col { max-width: 340px; min-width: 340px; }
+td.wipe-id-col code { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+@media (max-width: 767px) {
+    th.wipe-id-col { width: 260px; min-width: 260px; }
+    td.wipe-id-col { max-width: 260px; min-width: 260px; }
+}
+tr:hover { background: #1f3050; }
+tr.clickable { cursor: pointer; }
+.stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 10px;
+    margin-bottom: 15px;
+}
+@media (min-width: 768px) { .stats { gap: 15px; margin-bottom: 20px; } }
+.stat-box {
+    background: " + BackgroundDark + @";
+    padding: 12px;
+    border-radius: 8px;
+    text-align: center;
+}
+@media (min-width: 768px) { .stat-box { padding: 15px; } }
+.stat-value { font-size: 20px; font-weight: bold; color: " + AccentPrimary + @"; }
+@media (min-width: 768px) { .stat-value { font-size: 24px; } }
+.stat-label { font-size: 10px; color: " + TextSecondary + @"; margin-top: 4px; }
+@media (min-width: 768px) { .stat-label { font-size: 12px; } }
+.refresh-btn { background: " + AccentPrimary + @"; color: #000; }
+.refresh-btn:hover { background: #3dbdb5; }
+.logout-btn { background: " + TextMuted + @"; margin-top: 15px; }
+@media (min-width: 768px) { .logout-btn { margin-top: 20px; } }
+.logout-btn:hover { background: #555; }
+.last-update { color: " + TextMuted + @"; font-size: 11px; margin-top: 10px; }
+.badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    margin-right: 4px;
+    margin-bottom: 4px;
+}
+@media (min-width: 768px) { .badge { font-size: 11px; margin-right: 5px; } }
+.badge-success { background: rgba(100, 200, 100, 0.2); color: " + Success + @"; }
+.badge-warning { background: rgba(255, 193, 7, 0.2); color: " + Warning + @"; }
+.badge-info { background: rgba(0, 217, 255, 0.2); color: " + AccentInfo + @"; }
+.action-btn.secondary { background: " + TextMuted + @"; color: #fff; }
+.action-btn.secondary:hover { background: #555; }
+.action-buttons { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+@media (min-width: 768px) { .action-buttons { gap: 10px; margin-top: 15px; } }
+.action-buttons .action-btn { width: auto; min-width: 100px; flex: 1; }
+.loading { text-align: center; padding: 30px; color: " + TextSecondary + @"; }
+.error-box {
+    background: rgba(255, 107, 107, 0.1);
+    border: 1px solid " + AccentSecondary + @";
+    border-radius: 8px;
+    padding: 12px;
+    color: " + AccentSecondary + @";
+    font-size: 14px;
+}
+@media (min-width: 768px) { .error-box { padding: 15px; } }
+.info-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 8px;
+    margin-bottom: 15px;
+}
+@media (min-width: 768px) { .info-grid { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; } }
+.info-item { background: " + BackgroundDark + @"; padding: 10px; border-radius: 6px; }
+@media (min-width: 768px) { .info-item { padding: 12px; } }
+.info-item .label { font-size: 10px; color: " + TextMuted + @"; text-transform: uppercase; }
+@media (min-width: 768px) { .info-item .label { font-size: 11px; } }
+.info-item .value { font-size: 13px; color: " + AccentPrimary + @"; margin-top: 4px; }
+@media (min-width: 768px) { .info-item .value { font-size: 14px; } }
+.clickable { cursor: pointer; }
+.clickable:hover { opacity: 0.8; }
+.badge.clickable:hover { background: rgba(0, 217, 255, 0.4); }
+.detail-link { color: " + AccentPrimary + @"; text-decoration: none; font-size: 11px; }
+@media (min-width: 768px) { .detail-link { font-size: 12px; } }
+.detail-link:hover { text-decoration: underline; }
+.pos-cell { font-family: monospace; font-size: 10px; word-break: break-word; }
+@media (min-width: 768px) { .pos-cell { font-size: 11px; } }
+.modal {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.7);
+    z-index: 1000;
+    padding: 10px;
+}
+.modal.show { display: flex; align-items: flex-start; justify-content: center; overflow-y: auto; }
+@media (min-width: 768px) { .modal { padding: 0; align-items: center; } }
+.modal-content {
+    background: " + BackgroundSecondary + @";
+    border-radius: 10px;
+    padding: 15px;
+    max-width: 1400px;
+    width: 100%;
+    max-height: calc(100vh - 20px);
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+@media (min-width: 768px) { .modal-content { padding: 20px; max-height: 90vh; } }
+.modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; flex-wrap: wrap; gap: 10px; }
+@media (min-width: 768px) { .modal-header { margin-bottom: 15px; } }
+.modal-header h2 { margin: 0; }
+.close-btn { background: none; border: none; color: " + AccentSecondary + @"; font-size: 28px; cursor: pointer; width: auto; padding: 5px 10px; min-height: 44px; min-width: 44px; }
+.close-btn:hover { color: #ff5252; }
+.pagination { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+@media (min-width: 768px) { .pagination { gap: 10px; margin-top: 15px; } }
+.pagination button {
+    padding: 10px 14px;
+    background: " + AccentPrimary + @";
+    border: none;
+    border-radius: 5px;
+    color: #000;
+    cursor: pointer;
+    width: auto;
+    min-width: 44px;
+    min-height: 44px;
+    font-size: 14px;
+}
+.pagination button:disabled { background: " + TextMuted + @"; cursor: not-allowed; }
+.pagination button:hover:not(:disabled) { background: #3dbdb5; }
+.pagination span { color: " + TextSecondary + @"; font-size: 12px; }
+@media (min-width: 768px) { .pagination span { font-size: 14px; } }
+.filter-bar { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; overflow-x: auto; -webkit-overflow-scrolling: touch; padding-bottom: 5px; }
+@media (min-width: 768px) { .filter-bar { gap: 10px; margin-bottom: 15px; } }
+.filter-bar .badge { cursor: pointer; white-space: nowrap; padding: 6px 10px; font-size: 11px; }
+@media (min-width: 768px) { .filter-bar .badge { padding: 4px 8px; font-size: 12px; } }
+.filter-bar .badge.active { background: " + AccentPrimary + @"; color: #000; }
+.download-link { color: " + AccentPrimary + @"; cursor: pointer; text-decoration: underline; font-size: 12px; }
+@media (min-width: 768px) { .download-link { font-size: 14px; } }
+.download-link:hover { color: #3dbdb5; }
+.map-preview {
+    display: inline-block;
+    margin-bottom: 8px;
+    cursor: zoom-in;
+}
+.map-preview img {
+    max-width: 100px;
+    border-radius: 6px;
+    border: 2px solid " + AccentPrimary + @";
+    background: " + BackgroundDark + @";
+    transition: transform 0.15s ease;
+}
+@media (min-width: 768px) { .map-preview img { max-width: 120px; } }
+.map-preview:hover img { transform: scale(1.03); }
+.map-preview-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.85);
+    z-index: 2000;
+    align-items: center;
+    justify-content: center;
+    padding: 10px;
+}
+.map-preview-overlay img {
+    max-width: 100%;
+    max-height: 100%;
+    border-radius: 10px;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+}
+p { color: " + TextSecondary + @"; margin-bottom: 12px; font-size: 13px; }
+@media (min-width: 768px) { p { margin-bottom: 15px; font-size: 14px; } }
+@media (max-width: 767px) {
+    .desktop-only { display: none !important; }
+    .mobile-friendly { touch-action: manipulation; }
+}
+@media (min-width: 768px) {
+    .mobile-only { display: none !important; }
+}
+";
 
         public static string Get3DViewerStyles() => @"
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            overflow: hidden;
-            font-family: 'Segoe UI', Arial, sans-serif;
-            background: " + BackgroundPrimary + @";
-            touch-action: none;
-            position: fixed;
-            width: 100%;
-            height: 100%;
-        }
-        #canvas-container { width: 100vw; height: 100vh; height: 100dvh; }
-        #loading {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background: linear-gradient(135deg, " + BackgroundPrimary + @" 0%, #16213e 100%);
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            z-index: 1000; transition: opacity 0.5s ease;
-        }
-        #loading.hidden { opacity: 0; pointer-events: none; }
-        .loader {
-            width: 60px; height: 60px; border: 4px solid rgba(255,255,255,0.1);
-            border-top-color: " + AccentInfo + @"; border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-        @keyframes spin { to { transform: rotate(360deg); } }
-        #loading-text { color: " + AccentInfo + @"; margin-top: 20px; font-size: 18px; letter-spacing: 2px; }
-        #debug-info {
-            position: fixed; top: 1px; left: 1px; background: rgba(0,0,0,0.85);
-            padding: 15px; border-radius: 10px; color: " + Success + @"; font-size: 12px;
-            font-family: monospace; max-width: 500px; max-height: 300px; overflow-y: auto; z-index: 1001;
-        }
-        #debug-info.hidden { display: none; }
-        #debug-info .error { color: #ff4444; }
-        #debug-info .success { color: " + Success + @"; }
-        #debug-info .info { color: " + Warning + @"; }
-        #controls {
-            position: fixed; bottom: 1px; left: 1px; background: rgba(0,0,0,0.7);
-            padding: 5px 10px; border-radius: 5px; color: #fff; font-size: 8px;
-            backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
-        }
-        #controls h3 { color: " + AccentInfo + @"; margin-bottom: 10px; font-size: 8px; }
-        #controls p { margin: 5px 0; opacity: 0.8; }
-        #controls span { color: " + AccentInfo + @"; font-weight: bold; }
-        #info {
-            position: fixed; top: 1px; right: 1px; background: rgba(0,0,0,0.7);
-            padding: 5px 10px; border-radius: 6px; color: #fff; font-size: 10px;
-            backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
-        }
-        #info .coord { color: " + AccentInfo + @"; font-family: monospace; }
-        #layer-toggle {
-            position: fixed; top: 1px; left: 50%; transform: translateX(-50%);
-            background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 10px;
-            backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
-            display: flex; gap: 15px; z-index: 1001;
-        }
-        #layer-toggle label { font-size: 8px; color: #fff; cursor: pointer; display: flex; align-items: center; gap: 5px; }
-        #layer-toggle input[type=""checkbox""] { accent-color: " + AccentInfo + @"; }
-        .viewer-btn {
-            position: fixed; bottom: 10px; right: 10px;
-            width: 80px; height: 30px;
-            background: rgba(0, 100, 0, 0.7); border: 2px solid " + Success + @";
-            border-radius: 8px; color: " + Success + @"; font-size: 12px;
-            font-weight: bold; cursor: pointer; z-index: 1003;
-            transition: all 0.2s ease;
-        }
-        .viewer-btn:hover { background: rgba(0, 150, 0, 0.8); }
-        .viewer-btn.active { background: rgba(255, 0, 0, 0.6); color: #fff; border-color: #ff4444; box-shadow: 0 0 10px rgba(255, 68, 68, 0.5); }
-        @media (hover: none), (pointer: coarse) {
-            #controls { display: none !important; }
-            #layer-toggle { flex-wrap: wrap; justify-content: center; max-width: 90%; }
-            #layer-toggle label { font-size: 11px; }
-            #info { font-size: 11px; padding: 10px 15px; }
-            .viewer-btn { display: none; }
-        }";
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body {
+overflow: hidden;
+font-family: 'Segoe UI', Arial, sans-serif;
+background: " + BackgroundPrimary + @";
+touch-action: none;
+position: fixed;
+width: 100%;
+height: 100%;
+}
+#canvas-container { width: 100vw; height: 100vh; height: 100dvh; }
+#loading {
+position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+background: linear-gradient(135deg, " + BackgroundPrimary + @" 0%, #16213e 100%);
+display: flex; flex-direction: column; align-items: center; justify-content: center;
+z-index: 1000; transition: opacity 0.5s ease;
+}
+#loading.hidden { opacity: 0; pointer-events: none; }
+.loader {
+width: 60px; height: 60px; border: 4px solid rgba(255,255,255,0.1);
+border-top-color: " + AccentInfo + @"; border-radius: 50%;
+animation: spin 1s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#loading-text { color: " + AccentInfo + @"; margin-top: 20px; font-size: 18px; letter-spacing: 2px; }
+#debug-info {
+position: fixed; top: 1px; left: 1px; background: rgba(0,0,0,0.85);
+padding: 15px; border-radius: 10px; color: " + Success + @"; font-size: 12px;
+font-family: monospace; max-width: 500px; max-height: 300px; overflow-y: auto; z-index: 1001;
+}
+#debug-info.hidden { display: none; }
+#debug-info .error { color: #ff4444; }
+#debug-info .success { color: " + Success + @"; }
+#debug-info .info { color: " + Warning + @"; }
+#controls {
+position: fixed; bottom: 1px; left: 1px; background: rgba(0,0,0,0.7);
+padding: 5px 10px; border-radius: 5px; color: #fff; font-size: 8px;
+backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
+}
+#controls h3 { color: " + AccentInfo + @"; margin-bottom: 10px; font-size: 8px; }
+#controls p { margin: 5px 0; opacity: 0.8; }
+#controls span { color: " + AccentInfo + @"; font-weight: bold; }
+#info {
+position: fixed; top: 1px; right: 1px; background: rgba(0,0,0,0.7);
+padding: 5px 10px; border-radius: 6px; color: #fff; font-size: 10px;
+backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
+}
+#info .coord { color: " + AccentInfo + @"; font-family: monospace; }
+#layer-toggle {
+position: fixed; top: 1px; left: 50%; transform: translateX(-50%);
+background: rgba(0,0,0,0.7); padding: 10px 20px; border-radius: 10px;
+backdrop-filter: blur(10px); border: 1px solid rgba(0,217,255,0.3);
+display: flex; gap: 15px; z-index: 1001;
+}
+#layer-toggle label { font-size: 8px; color: #fff; cursor: pointer; display: flex; align-items: center; gap: 5px; }
+#layer-toggle input[type=""checkbox""] { accent-color: " + AccentInfo + @"; }
+#joystick-container {
+position: fixed;
+bottom: 10px;
+left: 10px;
+width: 120px;
+height: 120px;
+background: rgba(0, 0, 0, 0.5);
+border-radius: 50%;
+border: 3px solid rgba(0, 217, 255, 0.5);
+touch-action: none;
+z-index: 1002;
+display: none;
+}
+#joystick-knob {
+position: absolute;
+width: 50px;
+height: 50px;
+background: rgba(0, 217, 255, 0.8);
+border-radius: 50%;
+top: 50%;
+left: 50%;
+transform: translate(-50%, -50%);
+box-shadow: 0 0 15px rgba(0, 217, 255, 0.5);
+}
+#joystick-knob::after {
+content: '';
+position: absolute;
+width: 20px;
+height: 20px;
+background: rgba(255, 255, 255, 0.6);
+border-radius: 50%;
+top: 50%;
+left: 50%;
+transform: translate(-50%, -50%);
+}
+#look-area {
+position: fixed;
+top: 0;
+right: 0;
+width: 50%;
+height: 100%;
+touch-action: none;
+z-index: 1001;
+display: none;
+}
+#speed-btn {
+position: fixed;
+bottom: 160px;
+left: 10px;
+width: 60px;
+height: 60px;
+background: rgba(0, 0, 0, 0.5);
+border: 3px solid rgba(0, 217, 255, 0.5);
+border-radius: 50%;
+color: " + AccentInfo + @";
+font-size: 11px;
+font-weight: bold;
+cursor: pointer;
+z-index: 1002;
+display: none;
+align-items: center;
+justify-content: center;
+touch-action: none;
+}
+#speed-btn.active {
+background: rgba(0, 217, 255, 0.5);
+border-color: " + AccentInfo + @";
+}
+.viewer-btn {
+position: fixed; bottom: 10px; right: 10px;
+width: 80px; height: 30px;
+background: rgba(0, 100, 0, 0.7); border: 2px solid " + Success + @";
+border-radius: 8px; color: " + Success + @"; font-size: 12px;
+font-weight: bold; cursor: pointer; z-index: 1003;
+transition: all 0.2s ease;
+}
+.viewer-btn:hover { background: rgba(0, 150, 0, 0.8); }
+.viewer-btn.active { background: rgba(255, 0, 0, 0.6); color: #fff; border-color: #ff4444; box-shadow: 0 0 10px rgba(255, 68, 68, 0.5); }
+@media (hover: none), (pointer: coarse) {
+#controls { display: none !important; }
+#joystick-container { display: block; }
+#look-area { display: block; }
+#speed-btn { display: flex; }
+#noclip-btn { display: none; }
+#layer-toggle { flex-wrap: wrap; justify-content: center; max-width: 90%; padding: 8px 15px; }
+#layer-toggle label { font-size: 11px; }
+#info { font-size: 11px; padding: 10px 15px; }
+}
+@media (hover: hover) and (pointer: fine) {
+#controls { display: block; }
+}
+";
     }
 
     public static class HtmlCache
@@ -3647,7 +3808,12 @@ namespace RustRelayReceiver
 </div>
 <div id=""debug-info"" class=""hidden""></div>
 <div id=""canvas-container""></div>
+<div id=""joystick-container"">
+<div id=""joystick-knob""></div>
+</div>
+<div id=""look-area""></div>
 <button id=""back-btn"" class=""viewer-btn"" onclick=""window.history.back()"">Back</button>
+<button id=""speed-btn"">FAST</button>
 <button id=""noclip-btn"" class=""viewer-btn"">No Clip</button>
 <div id=""layer-toggle"">
 <label><input type=""checkbox"" id=""showDebug""> Debug</label>
@@ -3680,6 +3846,7 @@ const loadedGLBModels = {};
 let showDebug = false;
 let prefabMarkers = [];
 let prefabLabels = [];
+let collisionMeshes = [];
 let BBMarkers = [];
 let isPointerLocked = false;
 const tempMatrix = new THREE.Matrix4();
@@ -3709,19 +3876,32 @@ const RAIL_HEIGHT_OFFSET = 0.8;
 const RIVER_HEIGHT_OFFSET = 0.3;
 const SEGMENT_FORWARD = new THREE.Vector3(0, 0, 1);
 const CHECKBOX_STATE_KEY = 'mapViewer.layerStates';
+const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || ('ontouchstart' in window && navigator.maxTouchPoints > 0);
+let mobileSpeedMultiplier = 1;
+let joystickActive = false;
+let joystickTouchId = null;
+let joystickStartX = 0;
+let joystickStartY = 0;
+let joystickDeltaX = 0;
+let joystickDeltaY = 0;
+let lookTouchId = null;
+let lastLookX = 0;
+let lastLookY = 0;
 let noClipMode = false;
 let noClipSettings = {
-    walkSpeed: 5,
-    runSpeed: 10,
-    jumpHeight: 8.5,
-    duckHeight: 0.9,
-    eyeHeight: 1.55,
-    gravity: 21
+walkSpeed: 5,
+runSpeed: 10,
+jumpHeight: 8.5,
+duckHeight: 0.9,
+eyeHeight: 1.55,
+gravity: 21
 };
 let playerVelocity = new THREE.Vector3(0, 0, 0);
 let isGrounded = true;
 let isDucking = false;
 let baseCameraY = 1.6;
+const collisionRaycaster = new THREE.Raycaster();
+const rayDownDirection = new THREE.Vector3(0, -1, 0);
 const BBMarkerConfig = {
 'underwater_lab': { size: [200, 100, 200], type: 'cube', opacity: 0.2 },
 'entrance_bunker': { size: [100, 74, 100], type: 'cube', opacity: 0.2 },
@@ -3785,86 +3965,86 @@ const BBMarkerConfig = {
 function isBBMarkerType(prefabName) { return BBMarkerConfig.hasOwnProperty(prefabName); }
 function getBBConfig(label) { return BBMarkerConfig[label] || null; }
 function createBBSphereMarker(x, y, z, radius, label, opacity) {
-    opacity = opacity || 0.4;
-    const geometry = new THREE.SphereGeometry(radius, 32, 32);
-    const material = new THREE.MeshBasicMaterial({
-        color: 0xff0000,
-        transparent: true,
-        opacity: opacity,
-        side: THREE.DoubleSide,
-        depthWrite: false
-    });
-    const sphere = new THREE.Mesh(geometry, material);
-    sphere.position.set(x, y, z);
-    sphere.renderOrder = 10;
-    scene.add(sphere);
-    BBMarkers.push(sphere);
-    return sphere;
+opacity = opacity || 0.4;
+const geometry = new THREE.SphereGeometry(radius, 32, 32);
+const material = new THREE.MeshBasicMaterial({
+color: 0xff0000,
+transparent: true,
+opacity: opacity,
+side: THREE.DoubleSide,
+depthWrite: false
+});
+const sphere = new THREE.Mesh(geometry, material);
+sphere.position.set(x, y, z);
+sphere.renderOrder = 10;
+scene.add(sphere);
+BBMarkers.push(sphere);
+return sphere;
 }
 function createBBCubeMarker(x, y, z, sizeX, sizeY, sizeZ, rotX, rotY, rotZ, label, opacity) {
-    opacity = opacity || 0.35;
-    const geometry = new THREE.BoxGeometry(sizeX, sizeY, sizeZ);
-    const material = new THREE.MeshBasicMaterial({
-        color: 0xff0000,
-        transparent: true,
-        opacity: opacity,
-        side: THREE.DoubleSide,
-        depthWrite: false
-    });
-    const cube = new THREE.Mesh(geometry, material);
-    cube.position.set(x, y, z);
-    const eulerRot = new THREE.Euler(
-        THREE.MathUtils.degToRad(-rotX),
-        THREE.MathUtils.degToRad(-rotY),
-        THREE.MathUtils.degToRad(-rotZ),
-        'YXZ'
-    );
-    cube.rotation.copy(eulerRot);
-    cube.renderOrder = 10;
-    scene.add(cube);
-    BBMarkers.push(cube);
-    return cube;
+opacity = opacity || 0.35;
+const geometry = new THREE.BoxGeometry(sizeX, sizeY, sizeZ);
+const material = new THREE.MeshBasicMaterial({
+color: 0xff0000,
+transparent: true,
+opacity: opacity,
+side: THREE.DoubleSide,
+depthWrite: false
+});
+const cube = new THREE.Mesh(geometry, material);
+cube.position.set(x, y, z);
+const eulerRot = new THREE.Euler(
+THREE.MathUtils.degToRad(-rotX),
+THREE.MathUtils.degToRad(-rotY),
+THREE.MathUtils.degToRad(-rotZ),
+'YXZ'
+);
+cube.rotation.copy(eulerRot);
+cube.renderOrder = 10;
+scene.add(cube);
+BBMarkers.push(cube);
+return cube;
 }
 function createBBMarkerFromPrefab(prefab) {
-    const pos = prefab.position || prefab.Position || prefab.pos || prefab.Postion;
-    if (!pos) { return; }
-    const rot = prefab.rotation || prefab.Rotation || prefab.rot || { x: 0, y: 0, z: 0 };
-    const prefabName = prefab.Name || 'Unknown';
-    const config = getBBConfig(prefabName);
-    if (!config) { return; }
-    const x = pos[0] !== undefined ? pos[0] : (pos.x || 0);
-    const y = pos[1] !== undefined ? pos[1] : (pos.y || 0);
-    const z = pos[2] !== undefined ? -pos[2] : -(pos.z || 0);
-    const rotX = rot[0] !== undefined ? rot[0] : (rot.x || 0);
-    const rotY = rot[1] !== undefined ? rot[1] : (rot.y || 0);
-    const rotZ = rot[2] !== undefined ? rot[2] : (rot.z || 0);
-    switch (config.type) {
-        case 'cube':
-            let sizeX, sizeY, sizeZ;
-            if (Array.isArray(config.size)) {
-                sizeX = config.size[0];
-                sizeY = config.size[1];
-                sizeZ = config.size[2];
-            } else {
-                const s = config.radius || 50;
-                sizeX = s; sizeY = s; sizeZ = s;
-            }
-            createBBCubeMarker(x, y, z, sizeX, sizeY, sizeZ, rotX, rotY, rotZ, prefabName, config.opacity);
-            break;
-        case 'sphere':
-        default:
-            createBBSphereMarker(x, y, z, config.radius, prefabName, config.opacity);
-            break;
-    }
+const pos = prefab.position || prefab.Position || prefab.pos || prefab.Postion;
+if (!pos) { return; }
+const rot = prefab.rotation || prefab.Rotation || prefab.rot || { x: 0, y: 0, z: 0 };
+const prefabName = prefab.Name || 'Unknown';
+const config = getBBConfig(prefabName);
+if (!config) { return; }
+const x = pos[0] !== undefined ? pos[0] : (pos.x || 0);
+const y = pos[1] !== undefined ? pos[1] : (pos.y || 0);
+const z = pos[2] !== undefined ? -pos[2] : -(pos.z || 0);
+const rotX = rot[0] !== undefined ? rot[0] : (rot.x || 0);
+const rotY = rot[1] !== undefined ? rot[1] : (rot.y || 0);
+const rotZ = rot[2] !== undefined ? rot[2] : (rot.z || 0);
+switch (config.type) {
+case 'cube':
+let sizeX, sizeY, sizeZ;
+if (Array.isArray(config.size)) {
+sizeX = config.size[0];
+sizeY = config.size[1];
+sizeZ = config.size[2];
+} else {
+const s = config.radius || 50;
+sizeX = s; sizeY = s; sizeZ = s;
+}
+createBBCubeMarker(x, y, z, sizeX, sizeY, sizeZ, rotX, rotY, rotZ, prefabName, config.opacity);
+break;
+case 'sphere':
+default:
+createBBSphereMarker(x, y, z, config.radius, prefabName, config.opacity);
+break;
+}
 }
 function loadLayerState() { try { return JSON.parse(localStorage.getItem(CHECKBOX_STATE_KEY)) || {}; } catch { return {}; } }
 function saveLayerState(state) { localStorage.setItem(CHECKBOX_STATE_KEY, JSON.stringify(state)); }
 function applyCheckboxState(id, defaultValue) {
-    const saved = loadLayerState();
-    const checkbox = document.getElementById(id);
-    const value = saved[id] !== undefined ? saved[id] : defaultValue;
-    checkbox.checked = value;
-    return value;
+const saved = loadLayerState();
+const checkbox = document.getElementById(id);
+const value = saved[id] !== undefined ? saved[id] : defaultValue;
+checkbox.checked = value;
+return value;
 }
 showRoads = applyCheckboxState('showRoads', true);
 showRails = applyCheckboxState('showRails', true);
@@ -3875,22 +4055,22 @@ showLabels = applyCheckboxState('showLabels', true);
 showDebug = applyCheckboxState('showDebug', false);
 if (showDebug) { debugEl.classList.remove('hidden');} else { debugEl.classList.add('hidden');}
 function applyInitialVisibility() {
-    if (roadInstancer) roadInstancer.visible = showRoads;
-    if (railInstancer) railInstancer.visible = showRails;
-    if (waterMesh) waterMesh.visible = showWater;
-    if (riverInstancer) riverInstancer.visible = showWater;
-    prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
-    BBMarkers.forEach(function(m) { m.visible = showBB; });
-    prefabLabels.forEach(function(m) { m.visible = showLabels; });
+if (roadInstancer) roadInstancer.visible = showRoads;
+if (railInstancer) railInstancer.visible = showRails;
+if (waterMesh) waterMesh.visible = showWater;
+if (riverInstancer) riverInstancer.visible = showWater;
+prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
+BBMarkers.forEach(function(m) { m.visible = showBB; });
+prefabLabels.forEach(function(m) { m.visible = showLabels; });
 }
 function log(message, type) {
-    type = type || 'success';
-    if (showDebug) {
-        console.log(message);
-        const className = type === 'error' ? 'error' : type === 'info' ? 'info' : 'success';
-        debugEl.innerHTML += '<div class=""' + className + '"">' + new Date().toLocaleTimeString() + ' - ' + message + '</div>';
-        debugEl.scrollTop = debugEl.scrollHeight;
-    }
+type = type || 'success';
+if (showDebug) {
+console.log(message);
+const className = type === 'error' ? 'error' : type === 'info' ? 'info' : 'success';
+debugEl.innerHTML += '<div class=""' + className + '"">' + new Date().toLocaleTimeString() + ' - ' + message + '</div>';
+debugEl.scrollTop = debugEl.scrollHeight;
+}
 }
 function base64ToInt16Array(base64) {
 try {
@@ -3989,8 +4169,13 @@ await loadTerrain();
 applyInitialVisibility();
 camera.position.y = Math.max(300, TERRAIN_SIZE * 0.15);
 setupControls();
+setupMobileControls();
 setupNoclipButton();
 setupLayerToggleHandlers();
+if (isMobile) {
+const debugLabel = document.querySelector('#layer-toggle label input#showDebug')?.parentElement;
+if (debugLabel) debugLabel.style.display = 'none';
+}
 setTimeout(function() { document.getElementById('loading').classList.add('hidden'); }, 1000);
 animate();
 }
@@ -4108,6 +4293,7 @@ terrain = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({ vertexColors:
 terrain.rotation.x = -Math.PI / 2;
 terrain.name = 'terrain';
 scene.add(terrain);
+collisionMeshes.push(terrain);
 log('Terrain mesh created', 'success');
 }
 function createWaterMesh() {
@@ -4131,6 +4317,35 @@ const gridZ = Math.floor(percentZ * (res - 1));
 const flippedGridZ = (res - 1) - gridZ;
 if (gridX < 0 || gridX >= res || flippedGridZ < 0 || flippedGridZ >= res) return 0;
 return window.terrainHeights[flippedGridZ * res + gridX] || 0;
+}
+function getHeightAtPositionRaycast(worldX, worldY, worldZ, maxDistance = 100) {
+if(!noClipMode){return null;}
+const rayOrigin = new THREE.Vector3(worldX, worldY + 50, worldZ);
+collisionRaycaster.set(rayOrigin, rayDownDirection);
+collisionRaycaster.far = maxDistance;
+const raycastTargets = [];
+for (const marker of prefabMarkers) {
+if (!marker || !marker.visible) continue;
+if (marker.isSprite) continue;
+if (!marker.geometry) continue;
+raycastTargets.push(marker);
+}
+const intersects = collisionRaycaster.intersectObjects(raycastTargets, true);
+if (intersects.length > 0) { return intersects[0].point.y; }
+return null;
+}
+function collectCollisionMeshes(object, meshes) {
+object.traverse((child) => {
+if (child.isMesh && child.geometry) {
+if (child.geometry.attributes.position && child.geometry.attributes.position.count > 0) { meshes.push(child); }
+}
+});
+}
+function getGroundHeightAt(worldX, worldZ) {
+const raycastHeight = getHeightAtPositionRaycast(worldX, 0, worldZ, 150);
+let maxHeight = getTerrainHeightAt(worldX, worldZ);
+if (raycastHeight !== null) { maxHeight = Math.max(maxHeight, raycastHeight); }
+return maxHeight;
 }
 function drawRoadsFromServer(roadsData) {
 let index = 0;
@@ -4279,6 +4494,7 @@ applyTransformWithLocalOffsets(model, unityX, unityY, unityZ, unityRot, baseScal
 model.visible = showPrefabs;
 scene.add(model);
 prefabMarkers.push(model);
+collectCollisionMeshes(model, prefabMarkers);
 addPrefabLabel(prefabName, model.position.x, model.position.y, model.position.z);
 return;
 }
@@ -4289,6 +4505,7 @@ applyTransformWithLocalOffsets(model, unityX, unityY, unityZ, unityRot, baseScal
 model.visible = showPrefabs;
 scene.add(model);
 prefabMarkers.push(model);
+collectCollisionMeshes(model, prefabMarkers);
 addPrefabLabel(prefabName, model.position.x, model.position.y, model.position.z);
 }, function(error) {
 log('Failed to load model: ' + prefabName, 'error');
@@ -4362,61 +4579,62 @@ geometry.computeVertexNormals();
 terrain = new THREE.Mesh(geometry, new THREE.MeshLambertMaterial({ vertexColors: true }));
 terrain.rotation.x = -Math.PI / 2;
 scene.add(terrain);
+collisionMeshes.push(terrain);
 }
 function setupLayerToggleHandlers() {
 document.getElementById('showDebug').addEventListener('change', function(e) {
-    showDebug = e.target.checked;
-    const state = loadLayerState();
-    state['showDebug'] = showDebug;
-    saveLayerState(state);
-    if (showDebug) {
-        debugEl.classList.remove('hidden');
-    } else {
-        debugEl.classList.add('hidden');
-    }
+showDebug = e.target.checked;
+const state = loadLayerState();
+state['showDebug'] = showDebug;
+saveLayerState(state);
+if (showDebug) {
+debugEl.classList.remove('hidden');
+} else {
+debugEl.classList.add('hidden');
+}
 });
 document.getElementById('showRoads').addEventListener('change', function(e) {
-    showRoads = e.target.checked;
-    const state = loadLayerState();
-    state['showRoads'] = showRoads;
-    saveLayerState(state);
-    if (roadInstancer) roadInstancer.visible = showRoads;
+showRoads = e.target.checked;
+const state = loadLayerState();
+state['showRoads'] = showRoads;
+saveLayerState(state);
+if (roadInstancer) roadInstancer.visible = showRoads;
 });
 document.getElementById('showRails').addEventListener('change', function(e) {
-    showRails = e.target.checked;
-    const state = loadLayerState();
-    state['showRails'] = showRails;
-    saveLayerState(state);
-    if (railInstancer) railInstancer.visible = showRails;
+showRails = e.target.checked;
+const state = loadLayerState();
+state['showRails'] = showRails;
+saveLayerState(state);
+if (railInstancer) railInstancer.visible = showRails;
 });
 document.getElementById('showPrefabs').addEventListener('change', function(e) {
-    showPrefabs = e.target.checked;
-    const state = loadLayerState();
-    state['showPrefabs'] = showPrefabs;
-    saveLayerState(state);
-    prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
+showPrefabs = e.target.checked;
+const state = loadLayerState();
+state['showPrefabs'] = showPrefabs;
+saveLayerState(state);
+prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
 });
 document.getElementById('showBB').addEventListener('change', function(e) {
-    showBB = e.target.checked;
-    const state = loadLayerState();
-    state['showBB'] = showBB;
-    saveLayerState(state);
-    BBMarkers.forEach(function(m) { m.visible = showBB; });
+showBB = e.target.checked;
+const state = loadLayerState();
+state['showBB'] = showBB;
+saveLayerState(state);
+BBMarkers.forEach(function(m) { m.visible = showBB; });
 });
 document.getElementById('showWater').addEventListener('change', function(e) {
-    showWater = e.target.checked;
-    const state = loadLayerState();
-    state['showWater'] = showWater;
-    saveLayerState(state);
-    if (waterMesh) waterMesh.visible = showWater;
-    if (riverInstancer) riverInstancer.visible = showWater;
+showWater = e.target.checked;
+const state = loadLayerState();
+state['showWater'] = showWater;
+saveLayerState(state);
+if (waterMesh) waterMesh.visible = showWater;
+if (riverInstancer) riverInstancer.visible = showWater;
 });
 document.getElementById('showLabels').addEventListener('change', function(e) {
-    showLabels = e.target.checked;
-    const state = loadLayerState();
-    state['showLabels'] = showLabels;
-    saveLayerState(state);
-    prefabLabels.forEach(function(m) { m.visible = showLabels; });
+showLabels = e.target.checked;
+const state = loadLayerState();
+state['showLabels'] = showLabels;
+saveLayerState(state);
+prefabLabels.forEach(function(m) { m.visible = showLabels; });
 });
 }
 function setupControls() {
@@ -4472,6 +4690,155 @@ camera.updateProjectionMatrix();
 renderer.setSize(window.innerWidth, window.innerHeight);
 });
 }
+function setupMobileControls() {
+if (!isMobile) return;
+function requestFullscreen() {
+const elem = document.documentElement;
+if (elem.requestFullscreen) {
+elem.requestFullscreen().catch(() => {});
+} else if (elem.webkitRequestFullscreen) {
+elem.webkitRequestFullscreen();
+} else if (elem.msRequestFullscreen) {
+elem.msRequestFullscreen();
+}
+}
+let fullscreenRequested = false;
+function tryFullscreen() {
+if (!fullscreenRequested) {
+fullscreenRequested = true;
+requestFullscreen();
+}
+}
+document.addEventListener('touchstart', tryFullscreen, { once: true, passive: true });
+const joystickContainer = document.getElementById('joystick-container');
+const joystickKnob = document.getElementById('joystick-knob');
+const lookArea = document.getElementById('look-area');
+const speedBtn = document.getElementById('speed-btn');
+joystickContainer.addEventListener('touchstart', (e) => {
+e.preventDefault();
+if (joystickTouchId !== null) return;
+const touch = e.changedTouches[0];
+joystickTouchId = touch.identifier;
+const rect = joystickContainer.getBoundingClientRect();
+joystickStartX = rect.left + rect.width / 2;
+joystickStartY = rect.top + rect.height / 2;
+joystickActive = true;
+}, { passive: false });
+joystickContainer.addEventListener('touchmove', (e) => {
+e.preventDefault();
+for (const touch of e.changedTouches) {
+if (touch.identifier === joystickTouchId) {
+const dx = touch.clientX - joystickStartX;
+const dy = touch.clientY - joystickStartY;
+const maxDist = 40;
+const dist = Math.sqrt(dx * dx + dy * dy);
+const clampedDist = Math.min(dist, maxDist);
+const angle = Math.atan2(dy, dx);
+const clampedX = Math.cos(angle) * clampedDist;
+const clampedY = Math.sin(angle) * clampedDist;
+joystickKnob.style.transform = 'translate(calc(-50% + ' + clampedX + 'px), calc(-50% + ' + clampedY + 'px))';
+joystickDeltaX = clampedX / maxDist;
+joystickDeltaY = clampedY / maxDist;
+}
+}
+}, { passive: false });
+joystickContainer.addEventListener('touchend', (e) => {
+for (const touch of e.changedTouches) {
+if (touch.identifier === joystickTouchId) {
+joystickTouchId = null;
+joystickActive = false;
+joystickKnob.style.transform = 'translate(-50%, -50%)';
+joystickDeltaX = 0;
+joystickDeltaY = 0;
+}
+}
+});
+joystickContainer.addEventListener('touchcancel', (e) => {
+joystickTouchId = null;
+joystickActive = false;
+joystickKnob.style.transform = 'translate(-50%, -50%)';
+joystickDeltaX = 0;
+joystickDeltaY = 0;
+});
+lookArea.addEventListener('touchstart', (e) => {
+e.preventDefault();
+if (lookTouchId !== null) return;
+const touch = e.changedTouches[0];
+lookTouchId = touch.identifier;
+lastLookX = touch.clientX;
+lastLookY = touch.clientY;
+}, { passive: false });
+lookArea.addEventListener('touchmove', (e) => {
+e.preventDefault();
+for (const touch of e.changedTouches) {
+if (touch.identifier === lookTouchId) {
+const dx = touch.clientX - lastLookX;
+const dy = touch.clientY - lastLookY;
+lastLookX = touch.clientX;
+lastLookY = touch.clientY;
+euler.setFromQuaternion(camera.quaternion);
+euler.y -= dx * lookSpeed * 2;
+euler.x -= dy * lookSpeed * 2;
+euler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, euler.x));
+camera.quaternion.setFromEuler(euler);
+}
+}
+}, { passive: false });
+lookArea.addEventListener('touchend', (e) => {
+for (const touch of e.changedTouches) {
+if (touch.identifier === lookTouchId) {
+lookTouchId = null;
+}
+}
+});
+lookArea.addEventListener('touchcancel', (e) => { lookTouchId = null; });
+speedBtn.addEventListener('touchstart', (e) => {
+e.preventDefault();
+e.stopPropagation();
+mobileSpeedMultiplier = mobileSpeedMultiplier === 1 ? 6 : 1;
+speedBtn.classList.toggle('active', mobileSpeedMultiplier > 1);
+}, { passive: false });
+speedBtn.addEventListener('click', (e) => {
+e.preventDefault();
+e.stopPropagation();
+mobileSpeedMultiplier = mobileSpeedMultiplier === 1 ? 6 : 1;
+speedBtn.classList.toggle('active', mobileSpeedMultiplier > 1);
+});
+document.getElementById('canvas-container').addEventListener('touchstart', (e) => {
+if (e.target.id === 'canvas-container' && lookTouchId === null) {
+const touch = e.changedTouches[0];
+const rect = joystickContainer.getBoundingClientRect();
+const isInJoystick = touch.clientX < rect.right + 20 && touch.clientY > rect.top - 20;
+if (!isInJoystick) {
+lookTouchId = touch.identifier;
+lastLookX = touch.clientX;
+lastLookY = touch.clientY;
+}
+}
+}, { passive: false });
+document.getElementById('canvas-container').addEventListener('touchmove', (e) => {
+for (const touch of e.changedTouches) {
+if (touch.identifier === lookTouchId) {
+const dx = touch.clientX - lastLookX;
+const dy = touch.clientY - lastLookY;
+lastLookX = touch.clientX;
+lastLookY = touch.clientY;
+euler.setFromQuaternion(camera.quaternion);
+euler.y -= dx * lookSpeed * 2;
+euler.x -= dy * lookSpeed * 2;
+euler.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, euler.x));
+camera.quaternion.setFromEuler(euler);
+}
+}
+}, { passive: false });
+document.getElementById('canvas-container').addEventListener('touchend', (e) => {
+for (const touch of e.changedTouches) {
+if (touch.identifier === lookTouchId) {
+lookTouchId = null;
+}
+}
+});
+}
 function setupNoclipButton() {
 document.getElementById('noclip-btn').addEventListener('click', function() {
 noClipMode = !noClipMode;
@@ -4483,7 +4850,7 @@ playerVelocity.set(0, 0, 0);
 isGrounded = true;
 log('Noclip ON - Fly mode active', 'info');
 } else {
-const groundHeight = getTerrainHeightAt(camera.position.x, camera.position.z);
+const groundHeight = getGroundHeightAt(camera.position.x, camera.position.z);
 camera.position.y = groundHeight + baseCameraY;
 playerVelocity.set(0, 0, 0);
 isDucking = false;
@@ -4492,25 +4859,28 @@ log('Noclip OFF - Physics mode active', 'info');
 });
 }
 function updateMovement(delta) {
-if (!isPointerLocked) return;
+if (!isPointerLocked && !joystickActive) return;
 let moveX = 0;
 let moveZ = 0;
+let currentSpeed = moveSpeed;
 if (noClipMode) {
 const isRunning = keys.shift;
 moveZ = Number(keys.w) - Number(keys.s);
 moveX = Number(keys.d) - Number(keys.a);
-const currentSpeed = isRunning ? noClipSettings.runSpeed : noClipSettings.walkSpeed;
+currentSpeed = isRunning ? noClipSettings.runSpeed : noClipSettings.walkSpeed;
 baseCameraY = isDucking ? noClipSettings.duckHeight : noClipSettings.eyeHeight;
-const targetGroundHeight = getTerrainHeightAt(camera.position.x, camera.position.z) + baseCameraY;
+const targetGroundHeight = getGroundHeightAt(camera.position.x, camera.position.z) + baseCameraY;
+const feetPosition = camera.position.y - baseCameraY;
 if (!isGrounded) {
 playerVelocity.y -= noClipSettings.gravity * delta;
 }
 camera.position.y += playerVelocity.y * delta;
+const currentFeetPos = camera.position.y - baseCameraY;
 if (camera.position.y - baseCameraY <= targetGroundHeight) {
 camera.position.y = targetGroundHeight + baseCameraY;
 playerVelocity.y = 0;
 isGrounded = true;
-} else if (camera.position.y - baseCameraY > targetGroundHeight) {
+} else if (currentFeetPos > targetGroundHeight) {
 isGrounded = false;
 }
 if (moveX !== 0 || moveZ !== 0) {
@@ -4526,9 +4896,17 @@ movement.addScaledVector(forward, moveZ * speed);
 camera.position.add(movement);
 }
 } else {
+if (isMobile && joystickActive) {
+moveX = joystickDeltaX;
+moveZ = -joystickDeltaY;
+currentSpeed = moveSpeed * mobileSpeedMultiplier;
+}
+if (!isMobile) {
+if (!isPointerLocked) { return; }
 moveZ = Number(keys.w) - Number(keys.s);
 moveX = Number(keys.d) - Number(keys.a);
-const currentSpeed = keys.shift ? moveSpeed * 6 : moveSpeed;
+currentSpeed = keys.shift ? moveSpeed * 6 : moveSpeed;
+}
 if (moveX !== 0 || moveZ !== 0) {
 const speed = currentSpeed * delta;
 const forward = new THREE.Vector3();
@@ -4541,8 +4919,8 @@ movement.addScaledVector(right, moveX * speed);
 movement.addScaledVector(forward, moveZ * speed);
 camera.position.add(movement);
 }
-const terrainHeight = getTerrainHeightAt(camera.position.x, camera.position.z);
-camera.position.y = Math.max(terrainHeight + baseCameraY, camera.position.y);
+const terrainHeight = getGroundHeightAt(camera.position.x, camera.position.z);
+if(noClipMode){camera.position.y = Math.max(terrainHeight + baseCameraY, camera.position.y);}
 }
 const x = camera.position.x.toFixed(0);
 const y = camera.position.y.toFixed(0);
@@ -4956,38 +5334,40 @@ loadServerDetail();
                 html = @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
-    <meta charset=""UTF-8"">
-    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-    <title>Rust Relay Admin</title>
-    <style>
-        " + HtmlStyles.GetBaseStyles() + @"
-    </style>
+<meta charset=""UTF-8"">
+<meta name=""viewport"" content=""width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes"">
+<meta name=""apple-mobile-web-app-capable"" content=""yes"">
+<meta name=""apple-mobile-web-app-status-bar-style"" content=""black-translucent"">
+<title>Rust Relay Admin</title>
+<style>
+" + HtmlStyles.GetBaseStyles() + @"
+</style>
 </head>
 <body>
-    <div class=""container"">
-        <div class=""card login-form"">
-            <h1 class=""title"">Rust Relay Admin</h1>
-            <form id=""loginForm"">
-                <input type=""password"" id=""password"" placeholder=""Enter Password"" required>
-                <button type=""submit"">Login</button>
-                <p class=""error"" id=""errorMsg"">Invalid password</p>
-            </form>
-        </div>
-        <script>
-            document.getElementById('loginForm').addEventListener('submit', async function(e) {
-                e.preventDefault();
-                const password = document.getElementById('password').value;
-                const formData = new URLSearchParams();
-                formData.append('password', password);
-                try {
-                    const res = await fetch('/api/login', { method: 'POST', body: formData });
-                    const data = await res.json();
-                    if (data.success) { window.location.href = '/'; }
-                    else { document.getElementById('errorMsg').style.display = 'block'; }
-                } catch (err) { document.getElementById('errorMsg').style.display = 'block'; }
-            });
-        </script>
-    </div>
+<div class=""container"">
+<div class=""card login-form"">
+<h1 class=""title"">Rust Relay Admin</h1>
+<form id=""loginForm"">
+<input type=""password"" id=""password"" placeholder=""Enter Password"" required autocomplete=""current-password"">
+<button type=""submit"">Login</button>
+<p class=""error"" id=""errorMsg"">Invalid password</p>
+</form>
+</div>
+</div>
+<script>
+document.getElementById('loginForm').addEventListener('submit', async function(e) {
+e.preventDefault();
+const password = document.getElementById('password').value;
+const formData = new URLSearchParams();
+formData.append('password', password);
+try {
+const res = await fetch('/api/login', { method: 'POST', body: formData });
+const data = await res.json();
+if (data.success) { window.location.href = '/'; }
+else { document.getElementById('errorMsg').style.display = 'block'; }
+} catch (err) { document.getElementById('errorMsg').style.display = 'block'; }
+});
+</script>
 </body>
 </html>";
             }
@@ -4996,75 +5376,80 @@ loadServerDetail();
                 html = @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
-    <meta charset=""UTF-8"">
-    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-    <title>Rust Relay Admin</title>
-    <style>
-        " + HtmlStyles.GetBaseStyles() + @"
-    </style>
+<meta charset=""UTF-8"">
+<meta name=""viewport"" content=""width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes"">
+<meta name=""apple-mobile-web-app-capable"" content=""yes"">
+<meta name=""apple-mobile-web-app-status-bar-style"" content=""black-translucent"">
+<title>Rust Relay Admin</title>
+<style>
+" + HtmlStyles.GetBaseStyles() + @"
+</style>
 </head>
 <body>
-    <div class=""container"">
-        <h1 class=""title"">Rust Relay Admin</h1>
-        <button class=""refresh-btn"" onclick=""loadServers()"">Refresh</button>
-        <div class=""stats"" id=""stats""></div>
-        <div class=""card"">
-            <h2>Connected Servers</h2>
-            <p class=""subtitle"">Click on a server to view details</p>
-            <table class=""data-table"" id=""serversTable"">
-              <thead><tr><th class=""wipe-id-col"">Wipe ID</th><th>Connected</th><th>Last Activity</th><th>Packets</th><th>Bytes</th><th>Status</th></tr></thead>
-                <tbody id=""serversBody""></tbody>
-            </table>
-            <p class=""last-update"" id=""lastUpdate""></p>
-        </div>
-        <button class=""logout-btn"" onclick=""logout()"">Logout</button>
-        <script>
-            async function loadServers() {
-                try {
-                    const res = await fetch('/api/servers');
-                    if (res.status === 401) { window.location.reload(); return; }
-                    const data = await res.json();
-                    const servers = data.servers || [];
+<div class=""container"">
+<h1 class=""title"">Rust Relay Admin</h1>
+<button class=""refresh-btn"" onclick=""loadServers()"">Refresh</button>
+<div class=""stats"" id=""stats""></div>
+<div class=""card"">
+<h2>Connected Servers</h2>
+<p class=""subtitle"">Click on a server to view details</p>
+<div class=""table-wrapper"">
+<table class=""data-table"" id=""serversTable"">
+<thead><tr><th class=""wipe-id-col"">Wipe ID</th><th class=""desktop-only"">Connected</th><th class=""desktop-only"">Last Activity</th><th class=""desktop-only"">Packets</th><th class=""desktop-only"">Bytes</th><th>Status</th></tr></thead>
+<tbody id=""serversBody""></tbody>
+</table>
+</div>
+<p class=""last-update"" id=""lastUpdate""></p>
+</div>
+<button class=""logout-btn"" onclick=""logout()"">Logout</button>
+</div>
+<script>
+async function loadServers() {
+try {
+const res = await fetch('/api/servers');
+if (res.status === 401) { window.location.reload(); return; }
+const data = await res.json();
+const servers = data.servers || [];
 
-                    const totalPackets = servers.reduce(function(a, s) { return a + (s.packetsReceived || 0); }, 0);
-                    const totalBytes = servers.reduce(function(a, s) { return a + (s.bytesReceived || 0); }, 0);
-                    document.getElementById('stats').innerHTML = '<div class=""stat-box""><div class=""stat-value"">' + servers.length + '</div><div class=""stat-label"">Servers</div></div><div class=""stat-box""><div class=""stat-value"">' + totalPackets.toLocaleString() + '</div><div class=""stat-label"">Total Packets</div></div><div class=""stat-box""><div class=""stat-value"">' + formatBytes(totalBytes) + '</div><div class=""stat-label"">Total Data</div></div><div class=""stat-box""><div class=""stat-value"">' + servers.filter(function(s) { return s.hasMapData; }).length + '</div><div class=""stat-label"">With Map Data</div></div>';
-                    const tbody = document.getElementById('serversBody');
-                    if (servers.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan=""6"" class=""centered"">No servers connected</td></tr>';
-                    } else {
-                        tbody.innerHTML = servers.map(function(s) {
-                            const hasActivity = s.lastActivity && Date.parse(s.lastActivity) > (Date.now() - 5000);
-                            const statusBadges = [];
-                            if (s.hasMapData) statusBadges.push('<span class=""badge badge-success"">Map</span>');
-                            if (s.hasSnapshot) statusBadges.push('<span class=""badge badge-success"">Snapshot</span>');
-                            if (!hasActivity && s.packetsReceived > 0) statusBadges.push('<span class=""badge badge-warning"">offline</span>');
-                            return '<tr class=""clickable"" onclick=""window.location=\'/server/' + s.wipeId + '\'""><td class=""wipe-id-col""><code>' + s.wipeId + '</code></td><td>' + formatDate(s.connectedAt) + '</td><td>' + formatDate(s.lastActivity) + '</td><td>' + (s.packetsReceived || 0).toLocaleString() + '</td><td>' + formatBytes(s.bytesReceived || 0) + '</td><td>' + statusBadges.join(' ') + '</td></tr>';
-                        }).join('');
-                    }
-                    document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-                } catch (err) { console.error(err); }
-            }
-            function formatBytes(bytes) {
-                if (bytes === 0) return '0 B';
-                const k = 1024;
-                const sizes = ['B', 'KB', 'MB', 'GB'];
-                const i = Math.floor(Math.log(bytes) / Math.log(k));
-                return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-            }
-            function formatDate(isoString) {
-                if (!isoString) return 'N/A';
-                const d = new Date(isoString);
-                return d.toLocaleString();
-            }
-            async function logout() {
-                document.cookie = 'auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
-                window.location.reload();
-            }
-            loadServers();
-            setInterval(loadServers, 1000);
-        </script>
-    </div>
+const totalPackets = servers.reduce(function(a, s) { return a + (s.packetsReceived || 0); }, 0);
+const totalBytes = servers.reduce(function(a, s) { return a + (s.bytesReceived || 0); }, 0);
+document.getElementById('stats').innerHTML = '<div class=""stat-box""><div class=""stat-value"">' + servers.length + '</div><div class=""stat-label"">Servers</div></div><div class=""stat-box""><div class=""stat-value"">' + totalPackets.toLocaleString() + '</div><div class=""stat-label"">Total Packets</div></div><div class=""stat-box""><div class=""stat-value"">' + formatBytes(totalBytes) + '</div><div class=""stat-label"">Total Data</div></div>';
+const tbody = document.getElementById('serversBody');
+if (servers.length === 0) {
+tbody.innerHTML = '<tr><td colspan=""6"" class=""centered"">No servers connected</td></tr>';
+} else {
+tbody.innerHTML = servers.map(function(s) {
+const hasActivity = s.lastActivity && Date.parse(s.lastActivity) > (Date.now() - 5000);
+const statusBadges = [];
+if (hasActivity) statusBadges.push('<span class=""badge badge-success"">Online</span>');
+if (s.hasMapData) statusBadges.push('<span class=""badge badge-info"">Map</span>');
+if (s.hasSnapshot) statusBadges.push('<span class=""badge badge-info"">Snapshot</span>');
+if (!hasActivity && s.packetsReceived > 0) statusBadges.push('<span class=""badge badge-warning"">Offline</span>');
+return '<tr class=""clickable"" onclick=""window.location=\'/server/' + s.wipeId + '\'""><td class=""wipe-id-col""><code>' + s.wipeId + '</code></td><td class=""desktop-only"">' + formatDate(s.connectedAt) + '</td><td class=""desktop-only"">' + formatDate(s.lastActivity) + '</td><td class=""desktop-only"">' + (s.packetsReceived || 0).toLocaleString() + '</td><td class=""desktop-only"">' + formatBytes(s.bytesReceived || 0) + '</td><td>' + statusBadges.join(' ') + '</td></tr>';
+}).join('');
+}
+document.getElementById('lastUpdate').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+} catch (err) { console.error(err); }
+}
+function formatBytes(bytes) {
+if (bytes === 0) return '0 B';
+const k = 1024;
+const sizes = ['B', 'KB', 'MB', 'GB'];
+const i = Math.floor(Math.log(bytes) / Math.log(k));
+return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+function formatDate(isoString) {
+if (!isoString) return 'N/A';
+const d = new Date(isoString);
+return d.toLocaleString();
+}
+async function logout() {
+document.cookie = 'auth=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+window.location.reload();
+}
+loadServers();
+setInterval(loadServers, 1000);
+</script>
 </body>
 </html>";
             }
