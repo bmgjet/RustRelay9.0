@@ -9,16 +9,25 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <Configurations>Debug;Release;Arm64</Configurations>
     <Platforms>AnyCPU;ARM64</Platforms>
+    <AllowUnsafeBlocks>False</AllowUnsafeBlocks>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Arm64|AnyCPU'">
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Arm64|ARM64'">
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Properties\**" />
+    <EmbeddedResource Remove="Properties\**" />
+    <None Remove="Properties\**" />
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="LZ4">
       <HintPath>\Libs\LZ4.dll</HintPath>
     </Reference>
     <Reference Include="LZ4pn">
       <HintPath>\Libs\LZ4pn.dll</HintPath>
-    </Reference>
-    <Reference Include="Newtonsoft.Json">
-      <HintPath>\Libs\Newtonsoft.Json.dll</HintPath>
     </Reference>
     <Reference Include="protobuf-net">
       <HintPath>\Libs\protobuf-net.dll</HintPath>

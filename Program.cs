@@ -8,53 +8,61 @@
  ░    ░ ░      ░   ░ ░   ░  ░ ░ ░      ░    ░      
  ░             ░         ░  ░   ░      ░  ░*/
 using LZ4;
-using Newtonsoft.Json;
 using ProtoBuf;
 using RustRelayReceiver.ProtoBuf;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Drawing;
 using System.IO.Compression;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Serialization;
+using System.Text.Json;
 using static RustRelayReceiver.ProtoPacketProcessor;
+using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Diagnostics.CodeAnalysis;
 
 namespace RustRelayReceiver
 {
     class Program
     {
         // Configuration
-        public static string Version = "RustRelay9.0 V001";
+        public static string Version = "RustRelay9.0 V002";
         private static string _baseUrl = "http://localhost:8080";
         private static string _authToken = "demotoken";
-        private static readonly HttpListener _httpListener = new HttpListener();
-        private static readonly List<WebSocketClient> _webSocketClients = new List<WebSocketClient>();
-        private static readonly List<ServerInfo> _connectedServers = new List<ServerInfo>();
+        private static readonly HttpListener _httpListener = new();
+        private static readonly ConcurrentDictionary<WebSocketClient, string?> _webSocketClients = new();
+        private static readonly ConcurrentDictionary<string, ServerInfo> _connectedServers = new();
         private static readonly Dictionary<string, (WorldSerialization ws, DateTime loadedAt, string filePath)> _mapCache = new();
-        private static readonly object _clientsLock = new object();
-        private static readonly object _serversLock = new object();
+        private static readonly SemaphoreSlim _fileWriteSemaphore = new(1, 1);
+        private static readonly ConcurrentDictionary<string, Dictionary<uint, string>> _wipeStringPools = new();
+        private static readonly ConcurrentDictionary<uint, string> _globalStringPool = new();
+        private static readonly ConcurrentDictionary<WebSocketClient, byte[]> _clientBuffers = new();
+        private static readonly ConcurrentDictionary<string, (byte[] Data, long Timestamp)> _mapDataCache = new();
         private static readonly object _mapCacheLock = new();
-        private const int MAP_CACHE_TTL_MINUTES = 10;
-        private static readonly Dictionary<uint, string> _globalStringPool = new Dictionary<uint, string>();
-        private static readonly object _stringPoolLock = new object();
+        private const int MAP_CACHE_TTL_MINUTES = 30;
         private static long _totalPacketsReceived = 0;
-        private static long _startTime = Stopwatch.GetTimestamp();
+        private static readonly long _startTime = Stopwatch.GetTimestamp();
         private const int MarkerMagic = 1398035026;
         private const int MarkerLength = 12;
-        public static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1);
-        private static readonly object _consoleLock = new object();
+        public static readonly DateTime UnixEpoch = new();
+        private static readonly object _consoleLock = new();
         private static int _headerHeight = 0;
         private static readonly string DataDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "RelayData");
-        private static readonly object FileWriteLock = new object();
+        private static readonly object FileWriteLock = new();
         public static readonly string[] MapLayers = new string[] { "terrain", "height", "splat", "biome", "topology", "alpha", "water" };
+        public static readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, TrackedEntity>> _entitiesByWipe = new();
+        public static readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, TrackedEffect>> _effectsByWipe = new();
+        public static readonly ConcurrentDictionary<string, bool> _wipeIds = new();
 
         #region Server
         static void Main(string[] args)
         {
             PrintStatistics();
             ParseArguments(args);
-            LogDebug($"Starting {Version} relay server on {_baseUrl}");
+            Console.WriteLine($"Starting {Version} relay server on {_baseUrl}");
             StartHttpListener();
             Task.Run(async () =>
             {
@@ -72,7 +80,7 @@ namespace RustRelayReceiver
                 mre.Set();
             };
             mre.WaitOne();
-            LogDebug("\nShutting down...");
+            Console.WriteLine("\nShutting down...");
             StopAll();
         }
 
@@ -132,7 +140,7 @@ namespace RustRelayReceiver
 
         private static void OnStringPoolReceived(string? wipeId, Dictionary<uint, string> stringPool)
         {
-            SaveStringPoolToFile(wipeId, stringPool);
+            _ = SaveStringPoolToFile(wipeId, stringPool);
         }
 
         private static void OnManifestReceived(string? wipeId, Dictionary<uint, string> manifest)
@@ -151,47 +159,11 @@ namespace RustRelayReceiver
             SaveMapFileToDirectory(wipeId, filename, data);
             LogDebug($"[MapFile] {filename}");
         }
-        #endregion
 
-        #region PacketHooks
-        private static void OnEntityReceived(object? sender, Entity entity)
-        {
-            if (entity.baseNetworkable != null)
-            {
-                // LogDebug($"Entity received: ID={entity.baseNetworkable.uid}, PrefabID={entity.baseNetworkable.prefabId}");
-            }
-        }
-
-        private static void OnEntityPositionUpdated(object? sender, NetworkableId EntityId, Vector3? Position, Vector3? Rotation)
-        {
-            //  LogDebug($"Entity Pos: ID={EntityId.Value}");
-        }
-
-        private static void OnEntityDestroyed(object? sender, NetworkableId EntityId)
-        {
-            //    LogDebug($"Entity destroyed: ID={EntityId}");
-        }
-
-        private static void OnRPCMessageReceived(object? sender, uint ID, NetworkableId netid, byte[] data)
-        {
-            //   LogDebug($"RPCMessage: ID={ID}");
-        }
-
-        private static void OnVoiceDataReceived(object? sender, NetworkableId playerid, byte[] voicedata)
-        {
-            //   LogDebug($"VoiceData: ID={playerid.Value}");
-
-        }
-
-        private static void OnEffectReceived(object? sender, string Effectname, Vector3? pos, Vector3? Dir, uint ID)
-        {
-            //    LogDebug($"Effect: {Effectname} at {pos}");
-        }
-
-        private static void OnEntityFlagsUpdated(object? sender, NetworkableId EntityId, uint Flags)
-        {
-            //    LogDebug($"Entity flags update: ID={EntityId}, Flags={Flags}");
-        }
+        public static event Action<TrackedEntity, string>? OnEntityCreated;
+        public static event Action<TrackedEntity, string>? OnEntityUpdated;
+        public static event Action<string, ulong>? OnEntityDestroyed;
+        public static event Action<EffectData, string>? OnEffectDecoded;
         #endregion
 
         #region Processing
@@ -204,10 +176,7 @@ namespace RustRelayReceiver
                 if (context.Request.IsWebSocketRequest) { await HandleWebSocketRequest(context); }
                 else { _ = Task.Run(() => HandleHttpRequest(context)); }
             }
-            catch (Exception ex)
-            {
-                LogDebug($"Processing error: {ex.Message}");
-            }
+            catch (Exception ex) { LogDebug($"Processing error: {ex.Message}"); }
             finally { }
         }
 
@@ -224,11 +193,11 @@ namespace RustRelayReceiver
             {
                 throw new Exception("No boundary found");
             }
-            string boundary = contentType.Substring(boundaryIndex + 9);
+            string boundary = contentType[(boundaryIndex + 9)..];
             if (boundary.StartsWith("\""))
             {
                 int endQuote = boundary.IndexOf('"', 1);
-                if (endQuote > 0) { boundary = boundary.Substring(1, endQuote - 1); } else { boundary = boundary.Substring(1); }
+                if (endQuote > 0) { boundary = boundary[1..endQuote]; } else { boundary = boundary[1..]; }
             }
             else
             {
@@ -241,7 +210,7 @@ namespace RustRelayReceiver
                         break;
                     }
                 }
-                boundary = boundary.Substring(0, endIndex);
+                boundary = boundary[..endIndex];
             }
             using (var ms = new MemoryStream())
             {
@@ -262,7 +231,6 @@ namespace RustRelayReceiver
 
                 if (startPos + 1 < bodyLength && bodyBytes[startPos] == '\r' && bodyBytes[startPos + 1] == '\n') { startPos += 2; }
                 else if (startPos < bodyLength && bodyBytes[startPos] == '\n') { startPos += 1; }
-                byte[] crlf = Encoding.UTF8.GetBytes("\r\n");
                 byte[] doubleCrlf = Encoding.UTF8.GetBytes("\r\n\r\n");
                 byte[] boundaryWithCrlf = Encoding.UTF8.GetBytes("\r\n--" + boundary);
                 byte[] finalBoundary = Encoding.UTF8.GetBytes("\r\n--" + boundary + "--");
@@ -343,8 +311,9 @@ namespace RustRelayReceiver
                     WipeId = wipeId,
                     ConnectedAt = DateTime.UtcNow
                 };
-                lock (_clientsLock) { _webSocketClients.Add(client); }
-                var buffer = new byte[65536];
+                var remoteIp = context.Request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
+                _webSocketClients.AddOrUpdate(client, remoteIp, (_, __) => remoteIp);
+                byte[] buffer = _clientBuffers.GetOrAdd(client, _ => ArrayPool<byte>.Shared.Rent(65536));
                 while (webSocket.State == System.Net.WebSockets.WebSocketState.Open)
                 {
                     try
@@ -357,7 +326,7 @@ namespace RustRelayReceiver
                         }
                         else if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Binary)
                         {
-                            ProcessBinaryPacket(buffer, result.Count, wipeId);
+                            ProcessBinaryPacket(buffer.AsSpan(0, result.Count), result.Count, wipeId);
                         }
                     }
                     catch (Exception ex)
@@ -366,7 +335,7 @@ namespace RustRelayReceiver
                         break;
                     }
                 }
-                lock (_clientsLock) { _webSocketClients.Remove(client); }
+                _webSocketClients.TryRemove(client, out _);
                 await webSocket.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
             }
             catch (Exception ex) { LogDebug($"[WS] Connection error: {ex.Message}"); }
@@ -376,12 +345,11 @@ namespace RustRelayReceiver
         {
             var response = context.Response;
             var request = context.Request;
-            string? serverTime = request.Headers["X-Server-Time"];
             string? wipeId = request.Headers["X-Wipe-Id"];
             string? auth = request.Headers["Authorization"];
             try
             {
-                string? path = request.Url?.AbsolutePath.ToLower();
+                string? path = request.Url?.AbsolutePath.ToLower().Replace("//", "/");
                 if (string.IsNullOrEmpty(path)) { await HandleIndexPage(context); return; }
                 if (!string.IsNullOrEmpty(auth) && auth.Replace("Bearer ", "") == _authToken)
                 {
@@ -428,7 +396,15 @@ namespace RustRelayReceiver
                 }
                 else if (path.StartsWith("/3dmap/data/"))
                 {
-                    await Handle3DMapData(context);
+                    await Handle3DMapData(context, GetOptions());
+                }
+                else if (path.StartsWith("/3dmap/entities/"))
+                {
+                    await Handle3DEntitiesData(context);
+                }
+                else if (path.StartsWith("/3dmap/update/"))
+                {
+                    await Handle3DUpdateData(context);
                 }
                 else if (path.StartsWith("/3dviewer/"))
                 {
@@ -472,33 +448,527 @@ namespace RustRelayReceiver
             response.Close();
         }
 
-        private static void ProcessBinaryPacket(byte[]? buffer, int length, string? wipeId)
+        private static void HandleNetworkPacket(MessageType type, ReadOnlySpan<byte> packet, string? wipeId)
+        {
+            if (string.IsNullOrEmpty(wipeId)) { return; }
+            try
+            {
+                switch (type)
+                {
+                    case MessageType.Entities:
+                        try { DecodeEntities(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[Entities] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.EntityPosition:
+                        try { DecodeEntityPosition(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[EntityPosition] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.EntityDestroy:
+                        try { DecodeEntityDestroy(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[EntityDestroy] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.RPCMessage:
+                        try { DecodeRPCMessage(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[RPCMessage] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.Effect:
+                        try { DecodeEffect(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[Effect] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.VoiceData:
+                        try { DecodeVoiceData(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[VoiceData] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    case MessageType.EntityFlags:
+                        try { DecodeEntityFlags(packet, wipeId); }
+                        catch (Exception ex)
+                        {
+                            LogDebug($"[EntityFlags] wipeId={wipeId} {ex}");
+                        }
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[HandleNetworkPacket] type={type} wipeId={wipeId} {ex}");
+            }
+        }
+
+        private static void DecodeVoiceData(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 12) return;
+            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
+            int dataLength = BinaryPrimitives.ReadInt32LittleEndian(packet[8..]);
+            if (dataLength > 0 && packet.Length >= 12 + dataLength) { }
+            LogDebug($"[Voice] Wipe={wipeId} Entity={entityId} is data {dataLength}");
+        }
+
+        private static void DecodeEntityFlags(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 12) return;
+            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
+            int rawFlags = BinaryPrimitives.ReadInt32LittleEndian(packet[8..]);
+            if (_entitiesByWipe.TryGetValue(wipeId, out var entities) && entities.TryGetValue(entityId, out var entity))
+            {
+                entity.UpdateFlags(rawFlags);
+                OnEntityUpdated?.Invoke(entity, wipeId);
+            }
+        }
+
+        private static void DecodeEffect(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            try
+            {
+                var effect = DeserializeEffect(packet);
+                string? name = Path.GetFileName(GetStringFromPool(wipeId, effect.pooledstringid));
+                if (effect.pooledstringid != 0)
+                {
+                    var tracked = new TrackedEffect()
+                    {
+                        Id = effect.pooledstringid,
+                        pos = effect.origin,
+                        PrefabName = name
+                    };
+                    LogDebug($"[EFFECT] Wipe={wipeId} Type={effect.type} Origin=({effect.origin}) Name=({name})");
+                    if (_effectsByWipe.TryGetValue(wipeId, out var effects)) { effects[effect.pooledstringid] = tracked; }
+                    OnEffectDecoded?.Invoke(effect, wipeId);
+                }
+            }
+            catch { }
+        }
+
+        private static byte[] GetEntitiesJson(string wipeId)
+        {
+            if (!_entitiesByWipe.TryGetValue(wipeId, out var entities)) { return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}"); }
+            _effectsByWipe.TryGetValue(wipeId, out var effects);
+            int entityCount = 0;
+            foreach (var entity in entities.Values)
+                if (entity.pos != null) entityCount++;
+
+            int effectCount = 0;
+            if (effects != null)
+                foreach (var effect in effects.Values)
+                    if (effect.pos != null) effectCount++;
+
+            using var stream = new MemoryStream();
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false });
+            writer.WriteStartObject();
+            writer.WriteNumber("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            writer.WriteString("wipeId", wipeId);
+            writer.WriteNumber("entityCount", entityCount);
+            writer.WriteNumber("effectCount", effectCount);
+            writer.WriteStartArray("entities");
+            foreach (var entity in entities.Values)
+            {
+                if (entity.pos == null) { continue; }
+                writer.WriteStartObject();
+                writer.WriteNumber("id", entity.Id);
+                writer.WriteNumber("prefabId", entity.PrefabId);
+                writer.WriteString("prefabName", entity.PrefabName ?? "");
+                writer.WriteNumber("groupId", entity.GroupId);
+                writer.WriteStartObject("pos");
+                writer.WriteNumber("x", entity.pos.X);
+                writer.WriteNumber("y", entity.pos.Y);
+                writer.WriteNumber("z", entity.pos.Z);
+                writer.WriteEndObject();
+                if (entity.rot != null)
+                {
+                    writer.WriteStartObject("rot");
+                    writer.WriteNumber("x", entity.rot.X);
+                    writer.WriteNumber("y", entity.rot.Y);
+                    writer.WriteNumber("z", entity.rot.Z);
+                    writer.WriteEndObject();
+                }
+                writer.WriteNumber("flags", entity.Flags);
+                writer.WriteBoolean("isdestroyed", entity.isDestroyed);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteStartArray("effects");
+            if (effects != null)
+            {
+                foreach (var effect in effects.Values)
+                {
+                    if (effect.pos == null) { continue; }
+                    writer.WriteStartObject();
+                    writer.WriteNumber("id", effect.Id);
+                    writer.WriteString("prefabName", effect.PrefabName ?? "");
+                    writer.WriteStartObject("pos");
+                    writer.WriteNumber("x", effect.pos.X);
+                    writer.WriteNumber("y", effect.pos.Y);
+                    writer.WriteNumber("z", effect.pos.Z);
+                    writer.WriteEndObject();
+                    writer.WriteEndObject();
+                }
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.Flush();
+            return stream.ToArray();
+        }
+
+        private static byte[] GetEntitiesUpdatedSinceJson(string wipeId, float? cameraX, float? cameraY, float? cameraZ, bool unlimitedView)
+        {
+            const float DEFAULT_DISTANCE = 1000f;
+            if (!_entitiesByWipe.TryGetValue(wipeId, out var entities)) { return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}"); }
+            _effectsByWipe.TryGetValue(wipeId, out var effects);
+            int entityCount = 0;
+            int effectCount = 0;
+            List<ulong>? toRemove = null;
+            foreach (var entity in entities.Values)
+            {
+                if (entity.pos != null)
+                {
+                    entityCount++;
+                    if (entity.isDestroyed)
+                    {
+                        toRemove ??= new();
+                        toRemove.Add(entity.Id);
+                    }
+                }
+            }
+            if (effects != null)
+            {
+                foreach (var effect in effects.Values)
+                    if (effect.pos != null) effectCount++;
+            }
+            using var stream = new MemoryStream();
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false });
+            writer.WriteStartObject();
+            writer.WriteNumber("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            writer.WriteString("wipeId", wipeId);
+            writer.WriteNumber("entityCount", entityCount);
+            writer.WriteNumber("effectCount", effectCount);
+            writer.WriteStartArray("entities");
+            foreach (var entity in entities.Values)
+            {
+                if (entity.pos == null) { continue; }
+                if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
+                {
+                    float dx = entity.pos.X - cameraX.Value;
+                    float dz = entity.pos.Z - cameraZ.Value;
+                    float horizontalDist = MathF.Sqrt(dx * dx + dz * dz);
+                    if (horizontalDist > DEFAULT_DISTANCE) { continue; }
+                }
+                writer.WriteStartObject();
+                writer.WriteNumber("id", entity.Id);
+                writer.WriteNumber("prefabId", entity.PrefabId);
+                writer.WriteString("prefabName", entity.PrefabName ?? "");
+                writer.WriteNumber("groupId", entity.GroupId);
+                writer.WriteStartObject("pos");
+                writer.WriteNumber("x", entity.pos.X);
+                writer.WriteNumber("y", entity.pos.Y);
+                writer.WriteNumber("z", entity.pos.Z);
+                writer.WriteEndObject();
+                if (entity.rot != null)
+                {
+                    writer.WriteStartObject("rot");
+                    writer.WriteNumber("x", entity.rot.X);
+                    writer.WriteNumber("y", entity.rot.Y);
+                    writer.WriteNumber("z", entity.rot.Z);
+                    writer.WriteEndObject();
+                }
+                writer.WriteNumber("flags", entity.Flags);
+                writer.WriteBoolean("isdestroyed", entity.isDestroyed);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+            writer.WriteStartArray("effects");
+            if (effects != null)
+            {
+                foreach (var effect in effects.Values)
+                {
+                    if (effect.pos == null) continue;
+                    if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
+                    {
+                        float dx = effect.pos.X - cameraX.Value;
+                        float dz = effect.pos.Z - cameraZ.Value;
+                        float horizontalDist = MathF.Sqrt(dx * dx + dz * dz);
+                        if (horizontalDist > DEFAULT_DISTANCE) { continue; }
+                    }
+                    writer.WriteStartObject();
+                    writer.WriteNumber("id", effect.Id);
+                    writer.WriteString("prefabName", effect.PrefabName ?? "");
+                    writer.WriteStartObject("pos");
+                    writer.WriteNumber("x", effect.pos.X);
+                    writer.WriteNumber("y", effect.pos.Y);
+                    writer.WriteNumber("z", effect.pos.Z);
+                    writer.WriteEndObject();
+                    writer.WriteEndObject();
+                }
+            }
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.Flush();
+            if (toRemove != null)
+            {
+                foreach (var id in toRemove)
+                    entities.TryRemove(id, out _);
+            }
+            return stream.ToArray();
+        }
+
+        private static void DecodeEntityPosition(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 32) return;
+            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
+            float px = BinaryPrimitives.ReadSingleLittleEndian(packet[8..]);
+            float py = BinaryPrimitives.ReadSingleLittleEndian(packet[12..]);
+            float pz = BinaryPrimitives.ReadSingleLittleEndian(packet[16..]);
+            float rx = BinaryPrimitives.ReadSingleLittleEndian(packet[20..]);
+            float ry = BinaryPrimitives.ReadSingleLittleEndian(packet[24..]);
+            float rz = BinaryPrimitives.ReadSingleLittleEndian(packet[28..]);
+            if (_entitiesByWipe.TryGetValue(wipeId, out var entities) && entities.TryGetValue(entityId, out var entity))
+            {
+                entity.UpdatePosition(px, py, pz, rx, ry, rz);
+                OnEntityUpdated?.Invoke(entity, wipeId);
+            }
+        }
+
+        private static void DecodeEntityDestroy(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 8) return;
+            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
+            if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
+            {
+                if (entities.TryGetValue(entityId, out var entity))
+                {
+                    entity.isDestroyed = true;
+                }
+            }
+            LogDebug($"[DESTROY] Wipe={wipeId} Entity={entityId}");
+            OnEntityDestroyed?.Invoke(wipeId, entityId);
+        }
+
+        private static void DecodeRPCMessage(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 12) { return; }
+            ulong targetEntity = BinaryPrimitives.ReadUInt64LittleEndian(packet);
+            uint rpcId = BinaryPrimitives.ReadUInt32LittleEndian(packet[8..]);
+            string? RPCName = GetStringFromPool(wipeId, rpcId);
+            LogDebug($"[RPC] Wipe={wipeId} Entity={targetEntity} RPCId={rpcId}");
+        }
+
+        public static EffectData DeserializeEffect(ReadOnlySpan<byte> buffer)
+        {
+            var r = new ProtoReader(buffer);
+            var e = new EffectData();
+
+            while (!r.EOF)
+            {
+                uint tag = r.ReadTag();
+                if (tag == 0) { break; }
+                uint field = tag >> 3;
+                uint wire = tag & 7;
+                switch (field)
+                {
+                    case 1: e.type = (int)r.ReadVarUInt32(); break;
+                    case 2: e.pooledstringid = r.ReadVarUInt32(); break;
+                    case 3: e.number = (int)r.ReadVarUInt32(); break;
+                    case 4: e.origin = ProtoVector3.Deserialize(r.ReadBytes()); break;
+                    case 5: e.normal = ProtoVector3.Deserialize(r.ReadBytes()); break;
+                    case 6: e.scale = r.ReadFixed32(); break;
+                    case 7: e.entity = r.ReadVarUInt64(); break;
+                    case 8: e.bone = r.ReadVarUInt32(); break;
+                    case 9: e.source = r.ReadVarUInt64(); break;
+                    case 10: e.distanceOverride = r.ReadFixed32(); break;
+                    case 11: e.ignoreMaxSpawnDistance = r.ReadVarUInt32() != 0; break;
+                    case 12: e.sourceEntity = r.ReadVarUInt64(); break;
+                    default: r.Skip(wire); break;
+                }
+            }
+            return e;
+        }
+
+        private static void ProcessBinaryPacket(ReadOnlySpan<byte> buffer, int length, string? wipeId)
         {
             Interlocked.Increment(ref _totalPacketsReceived);
             UpdateServerStats(wipeId, length);
-            if (length < 4) { return; }
-            Span<byte> span = buffer.AsSpan(0, length);
-            if (length == MarkerLength)
+            if (buffer.Length < 4) { return; }
+
+            if (buffer.Length == MarkerLength && BinaryPrimitives.TryReadInt32LittleEndian(buffer, out int magic) && magic == MarkerMagic)
             {
-                int magic = BinaryPrimitives.ReadInt32LittleEndian(span);
-                if (magic == MarkerMagic)
+                long serverTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer[4..]);
+                HandleMarker(wipeId, serverTicks);
+                return;
+            }
+            int packetId = buffer[0];
+            if (packetId < 140) { return; }
+            var type = (MessageType)(packetId - 140);
+            HandleNetworkPacket(type, buffer[1..], wipeId);
+        }
+
+        private static void DecodeEntities(ReadOnlySpan<byte> packet, string wipeId)
+        {
+            if (packet.Length < 4) return;
+            var entity = ReadEntity(packet);
+            if (entity.HasValue && entity.Value.baseNetworkable.HasValue)
+            {
+                var bn = entity.Value.baseNetworkable.Value;
+                var tracked = new TrackedEntity
                 {
-                    long serverTicks = BinaryPrimitives.ReadInt64LittleEndian(span.Slice(4));
-                    HandleMarker(wipeId, serverTicks);
-                    return;
+                    Id = bn.uid.Value,
+                    PrefabId = bn.prefabID,
+                    GroupId = bn.group,
+                    PrefabName = Path.GetFileName(GetStringFromPool(wipeId, bn.prefabID))
+                };
+
+                if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
+                {
+                    entities[tracked.Id] = tracked;
+                    LogDebug($"[SPAWN] Wipe={wipeId} Prefab={bn.prefabID} NETID={bn.uid.Value}");
+                    OnEntityCreated?.Invoke(tracked, wipeId);
                 }
             }
-            int packetId = span[0];
-            if (packetId < 140) { return; }
-            MessageType type = (MessageType)(packetId - 140);
-            //HandleNetworkPacket(type, span, wipeId);
+        }
+
+        private static Entity? ReadEntity(ReadOnlySpan<byte> data)
+        {
+            var entity = new Entity();
+            int index = 4;
+            try
+            {
+                while (index < data.Length)
+                {
+                    byte tag = data[index];
+                    int fieldNumber = tag >> 3;
+                    int wireType = tag & 0x07;
+                    index++;
+
+                    switch (fieldNumber)
+                    {
+                        case 1:
+                            if (wireType == 2) { entity.baseNetworkable = ReadBaseNetworkable(data, ref index); }
+                            else { index += SkipField(data, wireType); }
+                            break;
+
+                        default:
+                            index += SkipField(data, wireType);
+                            break;
+                    }
+                }
+            }
+            catch { }
+            return entity;
+        }
+
+        private static BaseNetworkable? ReadBaseNetworkable(ReadOnlySpan<byte> data, ref int index)
+        {
+            var instance = new BaseNetworkable();
+            uint length = ReadVarUInt32(data, ref index);
+            int limit = index + (int)length;
+            while (index < limit)
+            {
+                byte tag = data[index++];
+                switch (tag)
+                {
+                    case 8:
+                        instance.uid = new NetworkableId(ReadVarUInt64(data, ref index));
+                        break;
+
+                    case 16:
+                        instance.group = ReadVarUInt32(data, ref index);
+                        break;
+
+                    case 24:
+                        instance.prefabID = ReadVarUInt32(data, ref index);
+                        break;
+
+                    default:
+                        SkipUnknownField(data, ref index, tag);
+                        break;
+                }
+            }
+            if (index != limit) { throw new Exception("Read past max limit"); }
+            return instance;
+        }
+
+        private static uint ReadVarUInt32(ReadOnlySpan<byte> data, ref int index)
+        {
+            uint result = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = data[index++];
+                result |= (uint)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) { return result; }
+                shift += 7;
+                if (shift > 35) { throw new Exception("Bad VarUInt32"); }
+            }
+        }
+
+        private static ulong ReadVarUInt64(ReadOnlySpan<byte> data, ref int index)
+        {
+            ulong result = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = data[index++];
+                result |= (ulong)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) { return result; }
+                shift += 7;
+                if (shift > 70) { throw new Exception("Bad VarUInt64"); }
+            }
+        }
+
+        private static void SkipUnknownField(ReadOnlySpan<byte> data, ref int index, byte tag)
+        {
+            int wireType = tag & 0x07;
+            switch (wireType)
+            {
+                case 0: while ((data[index++] & 0x80) != 0) { } return;
+                case 1: index += 8; return;
+                case 2: uint len = ReadVarUInt32(data, ref index); index += (int)len; return;
+                case 5: index += 4; return;
+                default: throw new Exception($"Unsupported wire type: {wireType}");
+            }
+        }
+
+        private static int SkipField(ReadOnlySpan<byte> data, int wireType)
+        {
+            int pos = 0;
+            return wireType switch
+            {
+                0 => 1,
+                1 => 8,
+                2 => 1 + (int)ReadVarUInt32(data, ref pos) + pos,
+                5 => 4,
+                _ => 0
+            };
         }
 
         private static async Task HandleModels(HttpListenerContext ctx)
         {
             if (ctx.Request.Url == null) { return; }
             if (!ctx.Request.Url.AbsolutePath.StartsWith("/models/", StringComparison.OrdinalIgnoreCase)) { return; }
-            string rawFileName = ctx.Request.Url.AbsolutePath.Substring("/models/".Length);
+            string rawFileName = ctx.Request.Url.AbsolutePath["/models/".Length..];
             if (rawFileName.Contains('?')) { rawFileName = rawFileName.Split('?')[0]; }
             string fileName = Path.GetFileName(rawFileName);
             string rootDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Models");
@@ -518,14 +988,14 @@ namespace RustRelayReceiver
             }
             string extension = Path.GetExtension(fileName).ToLowerInvariant();
             string contentType = "";
-            switch (extension)
+            contentType = extension switch
             {
-                case ".glb": contentType = "model/gltf-binary"; break;
-                case ".gltf": contentType = "model/gltf+json"; break;
-                case ".json": contentType = "application/json"; break;
-                case ".bin": contentType = "application/octet-stream"; break;
-                default: contentType = "application/octet-stream"; break;
-            }
+                ".glb" => "model/gltf-binary",
+                ".gltf" => "model/gltf+json",
+                ".json" => "application/json",
+                ".bin" => "application/octet-stream",
+                _ => "application/octet-stream",
+            };
             ;
             try
             {
@@ -557,78 +1027,32 @@ namespace RustRelayReceiver
             if (wipeId == null) return;
         }
 
-        private static void HandleNetworkPacket(MessageType type, Span<byte> packet, string? wipeId)
-        {
-            if (wipeId == null) { return; }
-            PacketHandler _handler = CreateHandler(
-                onEntity: e => OnEntityReceived(wipeId, e.Entity),
-                onPositionUpdate: e => OnEntityPositionUpdated(wipeId, e.EntityId, e.Position, e.Rotation),
-                onEntityDestroy: e => OnEntityDestroyed(wipeId, e.EntityId),
-                onRPC: e => OnRPCMessageReceived(wipeId, e.RPCId, e.TargetEntity, e.Data),
-                onEffect: e => OnEffectReceived(wipeId, e.EffectName, e.Position, e.Direction, e.EntityId),
-                onEntityFlags: e => OnEntityFlagsUpdated(wipeId, e.EntityId, e.Flags),
-                onVoice: e => OnVoiceDataReceived(wipeId, e.PlayerId, e.AudioData)
-            );
-            _handler.HandleNetworkPacket(type, packet.ToArray(), wipeId);
-        }
-
         private static async Task HandleIndexPage(HttpListenerContext context)
         {
-            var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            CookieCollection cookies = request.Cookies;
-            foreach (Cookie cookie in cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            bool isAuthenticated = !string.IsNullOrEmpty(authCookie) && authCookie == _authToken;
+            bool isAuthenticated = HasAuth(context, true);
             await SendHtmlResponse(response, 200, HTML.GetIndexHtmlBytes(isAuthenticated));
         }
 
         private static async Task HandleServersApi(HttpListenerContext context)
         {
-            var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
-            await SendJsonResponse(response, 200, new { servers = _connectedServers });
+            if (!HasAuth(context)) { return; }
+            var serversList = _connectedServers.Values.ToList();
+            await SendJsonResponse(response, 200, new { servers = serversList });
+        }
+
+        private static ServerInfo? GetServerByWipeId(string? wipeId)
+        {
+            if (string.IsNullOrEmpty(wipeId)) return null;
+            return _connectedServers.TryGetValue(wipeId, out var server) ? server : null;
         }
 
         private static async Task HandleServerDetailApi(HttpListenerContext context)
         {
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
+            if (!HasAuth(context)) { return; }
             string? path = request.Url?.AbsolutePath;
             string? wipeId = path?.Replace("/api/server/", "").Replace("/api/server", "");
             if (string.IsNullOrEmpty(wipeId))
@@ -636,8 +1060,7 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 400, new { error = "Server ID required" });
                 return;
             }
-            ServerInfo? server = null;
-            lock (_serversLock) { server = _connectedServers.FirstOrDefault(s => s.wipeId == wipeId); }
+            ServerInfo? server = GetServerByWipeId(wipeId);
             if (server == null)
             {
                 await SendJsonResponse(response, 404, new { error = "Server not found" });
@@ -718,11 +1141,11 @@ namespace RustRelayReceiver
             {
                 server = new
                 {
-                    wipeId = server.wipeId,
-                    connectedAt = server.connectedAt,
-                    lastActivity = server.lastActivity,
-                    packetsReceived = server.packetsReceived,
-                    bytesReceived = server.bytesReceived,
+                    server.wipeId,
+                    server.connectedAt,
+                    server.lastActivity,
+                    server.packetsReceived,
+                    server.bytesReceived,
                 },
                 files = new
                 {
@@ -739,24 +1162,10 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
+            if (!HasAuth(context)) { return; }
             string? path = request.Url?.AbsolutePath;
             string? wipeId = path?.Replace("/api/paths/", "").Split('/')[0];
-            int page = 1;
-            int.TryParse(request.QueryString["page"], out page);
+            int.TryParse(request.QueryString["page"], out int page);
             if (page < 1) page = 1;
             const int pageSize = 50;
             try
@@ -767,10 +1176,10 @@ namespace RustRelayReceiver
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
                     return;
                 }
-                var allPaths = worldSerialization.world.paths.Select((p, idx) => new { index = idx, name = p.name, spline = p.spline, start = p.start, end = p.end, width = p.width, nodes = p.nodes?.Count ?? 0 }).ToList();
+                var allPaths = worldSerialization.world.paths.Select((p, idx) => new { index = idx, p.name, p.spline, p.start, p.end, p.width, nodes = p.nodes?.Count ?? 0 }).ToList();
                 var totalPaths = allPaths.Count;
                 var pagedPaths = allPaths.Skip((page - 1) * pageSize).Take(pageSize).ToList();
-                await SendJsonResponse(response, 200, new { paths = pagedPaths, total = totalPaths, page = page, pageSize = pageSize, totalPages = (int)Math.Ceiling((double)totalPaths / pageSize) });
+                await SendJsonResponse(response, 200, new { paths = pagedPaths, total = totalPaths, page, pageSize, totalPages = (int)Math.Ceiling((double)totalPaths / pageSize) });
             }
             catch (Exception ex)
             {
@@ -783,24 +1192,10 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
+            if (!HasAuth(context)) { return; }
             string? path = request.Url?.AbsolutePath;
             string? wipeId = path?.Replace("/api/prefabs/", "").Split('/')[0];
-            int page = 1;
-            int.TryParse(request.QueryString["page"], out page);
+            int.TryParse(request.QueryString["page"], out int page);
             if (page < 1) page = 1;
             string? category = request.QueryString["category"];
             const int pageSize = 100;
@@ -822,14 +1217,14 @@ namespace RustRelayReceiver
                     {
                         index = idx,
                         category = p.category ?? "Unknown",
-                        id = p.id,
+                        p.id,
                         name = GetStringFromPool(wipeId, p.id) ?? "Unknown",
                         position = $"{p.position.x:F2}, {p.position.y:F2}, {p.position.z:F2}"
                     })
                     .ToList();
                 var totalPrefabs = prefabList.Count;
                 var pagedPrefabs = prefabList.Skip((page - 1) * pageSize).Take(pageSize).ToList();
-                await SendJsonResponse(response, 200, new { prefabs = pagedPrefabs, total = totalPrefabs, page = page, pageSize = pageSize, totalPages = (int)Math.Ceiling((double)totalPrefabs / pageSize), filterCategory = category ?? "all" });
+                await SendJsonResponse(response, 200, new { prefabs = pagedPrefabs, total = totalPrefabs, page, pageSize, totalPages = (int)Math.Ceiling((double)totalPrefabs / pageSize), filterCategory = category ?? "all" });
             }
             catch (Exception ex)
             {
@@ -842,20 +1237,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
+            if (!HasAuth(context)) { return; }
             string? path = request.Url?.AbsolutePath;
             string[]? parts = path?.Replace("/api/mapdata/", "").Split('/');
             string? wipeId = parts?[0];
@@ -889,23 +1271,7 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            foreach (Cookie cookie in request.Cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                response.StatusCode = 401;
-                byte[] buffer = Encoding.UTF8.GetBytes("Unauthorized");
-                response.ContentLength64 = buffer.Length;
-                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                return;
-            }
+            if (!HasAuth(context)) { return; }
             string? path = request.Url?.AbsolutePath;
             string[]? parts = path?.Replace("/api/download/", "").Split('/');
             if (parts?.Length < 2)
@@ -964,26 +1330,12 @@ namespace RustRelayReceiver
             }
         }
 
-        private static async Task Handle3DMapData(HttpListenerContext context)
+        private static async Task Handle3DEntitiesData(HttpListenerContext context)
         {
+            if (!HasAuth(context)) { return; }
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            CookieCollection cookies = request.Cookies;
-            foreach (Cookie cookie in cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
-            string? wipeId = request.Url?.AbsolutePath.Replace("/3dmap/data/", "").Replace("/3dmap/data/", "");
+            string? wipeId = request.Url?.AbsolutePath.Replace("/3dmap/entities/", "").Replace("/3dmap/entities/", "");
             if (string.IsNullOrEmpty(wipeId))
             {
                 await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
@@ -998,11 +1350,129 @@ namespace RustRelayReceiver
             }
             try
             {
-                string latestMapFile = mapFiles.Select(f => new FileInfo(f)).OrderByDescending(f => f.LastWriteTimeUtc).First().FullName;
-                List<object[]> mapRoads = new List<object[]>();
-                List<object[]> mapRails = new List<object[]>();
-                List<object[]> mapRivers = new List<object[]>();
-                List<object> prefabs = new List<object>();
+                byte[] jsonBytes = GetEntitiesJson(wipeId);
+                response.AddHeader("Content-Encoding", "gzip");
+                response.ContentType = "application/json";
+                using (var ms = new MemoryStream())
+                {
+                    using (var gzip = new GZipStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+                    {
+                        gzip.Write(jsonBytes, 0, jsonBytes.Length);
+                    }
+                    byte[] compressedBytes = ms.ToArray();
+                    response.ContentLength64 = compressedBytes.Length;
+                    await response.OutputStream.WriteAsync(compressedBytes, 0, compressedBytes.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[3DMAP] Error: {ex}");
+                response.StatusCode = 500;
+                byte[] buffer = Encoding.UTF8.GetBytes($"{{\"error\":\"{ex.Message.Replace("\"", "'")}\"}}");
+                response.ContentLength64 = buffer.Length;
+                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            }
+        }
+
+        private static async Task Handle3DUpdateData(HttpListenerContext context)
+        {
+            if (!HasAuth(context)) { return; }
+            var request = context.Request;
+            var response = context.Response;
+            string? wipeId = request.Url?.AbsolutePath.Replace("/3dmap/update/", "").Replace("/3dmap/update/", "");
+            if (string.IsNullOrEmpty(wipeId))
+            {
+                await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
+                return;
+            }
+            string mapsDir = Path.Combine(DataDirectory, wipeId, "Maps");
+            var mapFiles = Directory.GetFiles(mapsDir, "*.map");
+            if (mapFiles.Length <= 0)
+            {
+                await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
+                return;
+            }
+            float? cameraX = null, cameraY = null, cameraZ = null;
+            bool unlimitedView = false;
+            var query = request.QueryString;
+            if (query != null)
+            {
+                string? cx = query["cx"];
+                string? cy = query["cy"];
+                string? cz = query["cz"];
+                string? unlimited = query["unlimited"];
+                if (!string.IsNullOrEmpty(cx) && float.TryParse(cx, out float parsedX)) cameraX = parsedX;
+                if (!string.IsNullOrEmpty(cy) && float.TryParse(cy, out float parsedY)) cameraY = parsedY;
+                if (!string.IsNullOrEmpty(cz) && float.TryParse(cz, out float parsedCz)) cameraZ = -parsedCz;
+                if (!string.IsNullOrEmpty(unlimited) && bool.TryParse(unlimited, out bool parsedUnlimited)) unlimitedView = parsedUnlimited;
+            }
+            try
+            {
+                byte[] jsonBytes = GetEntitiesUpdatedSinceJson(wipeId, cameraX, cameraY, cameraZ, unlimitedView);
+                response.AddHeader("Content-Encoding", "gzip");
+                response.ContentType = "application/json";
+                using (var ms = new MemoryStream())
+                {
+                    using (var gzip = new GZipStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+                    {
+                        gzip.Write(jsonBytes, 0, jsonBytes.Length);
+                    }
+                    byte[] compressedBytes = ms.ToArray();
+                    response.ContentLength64 = compressedBytes.Length;
+                    await response.OutputStream.WriteAsync(compressedBytes, 0, compressedBytes.Length);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[3DMAP] Error: {ex}");
+                response.StatusCode = 500;
+                byte[] buffer = Encoding.UTF8.GetBytes($"{{\"error\":\"{ex.Message.Replace("\"", "'")}\"}}");
+                response.ContentLength64 = buffer.Length;
+                await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            }
+        }
+
+        private static JsonSerializerOptions GetOptions()
+        {
+            return new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            };
+        }
+
+        private static async Task Handle3DMapData(HttpListenerContext context, JsonSerializerOptions options)
+        {
+            if (!HasAuth(context)) { return; }
+            var request = context.Request;
+            var response = context.Response;
+            string? wipeId = request.Url?.AbsolutePath.Replace("/3dmap/data/", "").Replace("/3dmap/data/", "");
+            if (string.IsNullOrEmpty(wipeId))
+            {
+                await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
+                return;
+            }
+            if (_mapDataCache.TryGetValue(wipeId, out var cached))
+            {
+                response.AddHeader("Content-Encoding", "gzip");
+                SafeWrite(response, cached.Data, "application/json");
+                return;
+            }
+            string mapsDir = Path.Combine(DataDirectory, wipeId, "Maps");
+            var mapFiles = Directory.GetFiles(mapsDir, "*.map");
+            if (mapFiles.Length <= 0)
+            {
+                await SendHtmlResponse(response, 302, "", new Dictionary<string, string> { { "Location", "/" } });
+                return;
+            }
+            try
+            {
+                string? latestMapFile = Directory.EnumerateFiles(mapsDir, "*.map").FirstOrDefault();
+                if (latestMapFile is null) { return; }
+                List<object[]> mapRoads = new();
+                List<object[]> mapRails = new();
+                List<object[]> mapRivers = new();
+                List<object> prefabs = new();
                 byte[]? heightBytes = null;
                 byte[]? splatBytes = null;
                 int heightRes = 0;
@@ -1010,9 +1480,19 @@ namespace RustRelayReceiver
                 int worldsize = 4500;
                 try
                 {
-                    WorldSerialization worldSerialization = new WorldSerialization();
-                    worldSerialization.Load(latestMapFile);
+                    WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
+                    if (worldSerialization == null)
+                    {
+                        string errmsg = $"[3DMAP] Error: Can't Load World File {wipeId}";
+                        LogDebug(errmsg);
+                        response.StatusCode = 500;
+                        byte[] buffer = Encoding.UTF8.GetBytes($"{{\"error\": \"{errmsg}\"}}");
+                        response.ContentLength64 = buffer.Length;
+                        await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+                        return;
+                    }
                     worldsize = (int)worldSerialization.world.size;
+                    if (worldsize > 8000 || worldsize < 300) { worldsize = 8000; }
                     if (worldSerialization.world.paths != null)
                     {
                         foreach (var path in worldSerialization.world.paths)
@@ -1040,9 +1520,7 @@ namespace RustRelayReceiver
                         foreach (var pd in worldSerialization.world.prefabs)
                         {
                             string? name = GetStringFromPool(wipeId, pd.id);
-                            if (string.IsNullOrEmpty(name))
-                                continue;
-
+                            if (string.IsNullOrEmpty(name)) { continue; }
                             if (name.Contains("rock_formation_e") || name.Contains("rock_formation_a"))
                             {
                                 prefabs.Add(new
@@ -1059,6 +1537,17 @@ namespace RustRelayReceiver
                                 prefabs.Add(new
                                 {
                                     Name = "lava",
+                                    position = new VectorData(pd.position.x, pd.position.y, pd.position.z),
+                                    rotation = new VectorData(pd.rotation.x, pd.rotation.y, pd.rotation.z),
+                                    scale = new VectorData(pd.scale.x, pd.scale.y, pd.scale.z),
+                                });
+                                continue;
+                            }
+                            else if (name.Contains("modding/cubes"))
+                            {
+                                prefabs.Add(new
+                                {
+                                    Name = "cube",
                                     position = new VectorData(pd.position.x, pd.position.y, pd.position.z),
                                     rotation = new VectorData(pd.rotation.x, pd.rotation.y, pd.rotation.z),
                                     scale = new VectorData(pd.scale.x, pd.scale.y, pd.scale.z),
@@ -1132,24 +1621,22 @@ namespace RustRelayReceiver
                     },
                     roads = mapRoads,
                     rail = mapRails,
-                    prefabs = prefabs,
+                    prefabs,
                     river = mapRivers
                 };
 
                 response.AddHeader("Content-Encoding", "gzip");
+                byte[] compressedBytes;
                 using (var ms = new MemoryStream())
                 {
-                    using (var compressionStream = new GZipStream(ms, System.IO.Compression.CompressionLevel.Fastest, true))
-                    using (var writer = new StreamWriter(compressionStream, new UTF8Encoding(false)))
+                    using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
                     {
-                        var settings = new JsonSerializerSettings { ReferenceLoopHandling = ReferenceLoopHandling.Ignore };
-                        var serializer = JsonSerializer.Create(settings);
-                        serializer.Serialize(writer, terrainData);
-                        writer.Flush();
+                        JsonSerializer.Serialize(gzip, terrainData, options);
                     }
-                    byte[] compressedBytes = ms.ToArray();
-                    SafeWrite(response, compressedBytes, "application/json");
+                    compressedBytes = ms.ToArray();
                 }
+                _mapDataCache[wipeId] = (compressedBytes, latestMapFile.Length);
+                SafeWrite(response, compressedBytes, "application/json");
             }
             catch (Exception ex)
             {
@@ -1160,25 +1647,12 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             }
         }
+
         private static async Task Serve3DViewer(HttpListenerContext context)
         {
+            if (!HasAuth(context)) { return; }
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            CookieCollection cookies = request.Cookies;
-            foreach (Cookie cookie in cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
-            {
-                await SendJsonResponse(response, 401, new { error = "Unauthorized" });
-                return;
-            }
             string? wipeId = request.Url?.AbsolutePath.Replace("/3dviewer/", "").Replace("/3dviewer/", "");
             if (string.IsNullOrEmpty(wipeId))
             {
@@ -1190,19 +1664,10 @@ namespace RustRelayReceiver
 
         private static async Task HandleServerDetailPage(HttpListenerContext context)
         {
+            if (!HasAuth(context)) { return; }
             var request = context.Request;
             var response = context.Response;
-            string? authCookie = null;
-            CookieCollection cookies = request.Cookies;
-            foreach (Cookie cookie in cookies)
-            {
-                if (cookie.Name == "auth")
-                {
-                    authCookie = cookie.Value;
-                    break;
-                }
-            }
-            bool isAuthenticated = !string.IsNullOrEmpty(authCookie) && authCookie == _authToken;
+            bool isAuthenticated = HasAuth(context, true);
             if (!isAuthenticated)
             {
                 await SendHtmlResponse(response, 200, HTML.GetIndexHtmlBytes(isAuthenticated));
@@ -1225,7 +1690,9 @@ namespace RustRelayReceiver
                 if (EncryptedData == null) { return string.Empty; }
                 using (var aes = Aes.Create())
                 {
-                    var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), new byte[] { 73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118 });
+#pragma warning disable SYSLIB0041
+                    var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), [73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118]);
+#pragma warning restore SYSLIB0041
                     aes.Key = rfc2898DeriveBytes.GetBytes(32);
                     aes.IV = rfc2898DeriveBytes.GetBytes(16);
                     byte[] cipherText = Convert.FromBase64String(EncryptedData);
@@ -1247,7 +1714,9 @@ namespace RustRelayReceiver
             {
                 using (var aes = Aes.Create())
                 {
-                    var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), new byte[] { 73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118 });
+#pragma warning disable SYSLIB0041
+                    var rfc2898DeriveBytes = new Rfc2898DeriveBytes(PreFabCount.ToString(), [73, 118, 97, 110, 32, 77, 101, 100, 118, 101, 100, 101, 118]);
+#pragma warning restore SYSLIB0041
                     aes.Key = rfc2898DeriveBytes.GetBytes(32);
                     aes.IV = rfc2898DeriveBytes.GetBytes(16);
                     using (var memoryStream = new MemoryStream())
@@ -1278,7 +1747,7 @@ namespace RustRelayReceiver
                 int idx = body.IndexOf("password=") + 9;
                 int end = body.IndexOf('&', idx);
                 if (end < 0) end = body.Length;
-                password = Uri.UnescapeDataString(body.Substring(idx, end - idx));
+                password = Uri.UnescapeDataString(body.AsSpan(idx, end - idx));
             }
             bool success = password == _authToken;
             if (success)
@@ -1288,7 +1757,7 @@ namespace RustRelayReceiver
                 authCookie.Path = "/";
                 response.Cookies.Add(authCookie);
             }
-            await SendJsonResponse(response, success ? 200 : 401, new { success = success });
+            await SendJsonResponse(response, success ? 200 : 401, new { success });
         }
 
         private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, string html, Dictionary<string, string>? additionalHeaders = null)
@@ -1331,23 +1800,31 @@ namespace RustRelayReceiver
         {
             var request = context.Request;
             var response = context.Response;
-
-            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding))
+            string json;
+            using (var reader = new StreamReader(request.InputStream, request.ContentEncoding, leaveOpen: true))
             {
-                string json = await reader.ReadToEndAsync();
-                try
+                json = await reader.ReadToEndAsync();
+            }
+            try
+            {
+                var stringPool = SimpleJsonParser.ParseUintStringDict(json);
+                LogDebug($"[StringPool] Received {stringPool.Count} string entries");
+                OnStringPoolReceived(wipeId, stringPool);
+                MarkServerFileReceived(wipeId, "stringpool");
+                await SendJsonResponse(response, 200, new
                 {
-                    var stringPool = SimpleJsonParser.ParseUintStringDict(json);
-                    LogDebug($"[StringPool] Received {stringPool.Count} string entries");
-                    OnStringPoolReceived(wipeId, stringPool);
-                    MarkServerFileReceived(wipeId, "stringpool");
-                    await SendJsonResponse(response, 200, new { success = true, count = stringPool.Count });
-                }
-                catch (Exception ex)
+                    success = true,
+                    count = stringPool.Count
+                });
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[StringPool] Parse error: {ex.Message}");
+
+                await SendJsonResponse(response, 400, new
                 {
-                    LogDebug($"[StringPool] Parse error: {ex.Message}");
-                    await SendJsonResponse(response, 400, new { error = "Invalid JSON format" });
-                }
+                    error = "Invalid JSON format"
+                });
             }
         }
 
@@ -1419,35 +1896,43 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 400, new { error = ex.Message });
             }
         }
+
         private static MapInfo? LoadMapInfo(string wipeId)
         {
             var mapInfo = new MapInfo();
             try
             {
                 WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
-                if (worldSerialization == null) { return mapInfo; }
-                byte[]? tempdata = worldSerialization.GetMap("topology")?.data;
-                if (tempdata == null) { return null; }
-                int[]? Topology = new int[tempdata.Length];
-                Buffer.BlockCopy(tempdata, 0, Topology, 0, Topology.Length);
-                MapRender? mapRender = new MapRender(worldSerialization?.GetMap("splat")?.data, Topology);
+                if (worldSerialization == null) { return null; }
+                var topology = worldSerialization.GetMap("topology")?.data;
+                var splat = worldSerialization.GetMap("splat")?.data;
+                if (topology == null || splat == null) { return null; }
+                int[] Topology = new int[topology.Length];
+                if (Topology == null) { return null; }
+                Buffer.BlockCopy(topology, 0, Topology, 0, topology.Length);
+                MapRender? mapRender = new MapRender(splat, Topology);
                 mapInfo.png = CompressAndEncode(mapRender.Render());
-                mapInfo.worldsize = (int)worldSerialization.world.size;
-                mapInfo.mapCount = worldSerialization.world.maps.Count;
-                mapInfo.prefabCount = worldSerialization.world.prefabs.Count;
-                mapInfo.pathCount = worldSerialization.world.paths.Count;
+                var world = worldSerialization.world;
+                mapInfo.worldsize = (int)world.size;
+                if (mapInfo.worldsize > 8000 || mapInfo.worldsize < 300) mapInfo.worldsize = 8000;
+                mapInfo.mapCount = world.maps.Count;
+                mapInfo.prefabCount = world.prefabs.Count;
+                mapInfo.pathCount = world.paths.Count;
                 mapInfo.timestamp = worldSerialization.Timestamp;
-                foreach (var map in worldSerialization.world.maps)
+                foreach (var map in world.maps)
                 {
-                    if (MapLayers.Contains(map.name)) { mapInfo.mapNames.Add(map.name ?? "Unnamed"); }
-                    else { mapInfo.mapNames.Add(DecryptMapDataName(mapInfo.prefabCount, map.name) ?? "Unnamed"); }
+                    mapInfo.mapNames.Add(MapLayers.Contains(map.name) ? map.name ?? "Unnamed" : DecryptMapDataName(mapInfo.prefabCount, map.name) ?? "Unnamed");
                 }
-                var categoryGroups = worldSerialization.world.prefabs.GroupBy(p => string.IsNullOrEmpty(p.category) ? "Unknown" : p.category).ToDictionary(g => g.Key, g => g.Count());
-                mapInfo.prefabCategoryCounts = categoryGroups;
-                mapInfo.prefabCategories = categoryGroups.Keys.OrderBy(k => k).ToList();
-                foreach (var path in worldSerialization.world.paths) { if (!string.IsNullOrEmpty(path.name)) { mapInfo.pathNames.Add(path.name); } }
-                var monuments = worldSerialization.GetCustomMonuments();
-                mapInfo.customMonumentCount = monuments.Count();
+                var categories = world.prefabs.GroupBy(p => string.IsNullOrEmpty(p.category) ? "Unknown" : p.category).ToDictionary(g => g.Key, g => g.Count());
+                mapInfo.prefabCategoryCounts = categories;
+                mapInfo.prefabCategories = [.. categories.Keys.OrderBy(k => k)];
+                foreach (var path in world.paths)
+                {
+                    if (!string.IsNullOrEmpty(path.name))
+                        mapInfo.pathNames.Add(path.name);
+                }
+                var monuments = worldSerialization.GetCustomMonuments().ToList();
+                mapInfo.customMonumentCount = monuments.Count;
                 foreach (var monument in monuments)
                 {
                     mapInfo.customMonuments.Add(new
@@ -1457,11 +1942,11 @@ namespace RustRelayReceiver
                     });
                 }
                 LogDebug($"[MAP INFO] Loaded - Maps: {mapInfo.mapCount}, Prefabs: {mapInfo.prefabCount}, Paths: {mapInfo.pathCount}, Monuments: {mapInfo.customMonumentCount}");
-                if (mapInfo.worldsize > 8000 || mapInfo.worldsize < 300) { mapInfo.worldsize = 8000; }
             }
-            catch (Exception ex) { LogDebug($"[MAP INFO] Error loading map info: {ex.Message}"); }
+            catch (Exception ex) { LogDebug($"[MAP INFO] Error: {ex.Message}"); }
             return mapInfo;
         }
+
         #endregion
 
         #region Functions
@@ -1471,28 +1956,55 @@ namespace RustRelayReceiver
             string url = "https://github.com/bmgjet/MapGenny/raw/refs/heads/main/Models.zip";
             string rootPath = AppDomain.CurrentDomain.BaseDirectory;
             string zipPath = Path.Combine(rootPath, "Models.zip");
-            using (WebClient client = new())
-            {
-                try
-                {
-                    LogDebug("Downloading Models...");
-                    client.DownloadFile(url, zipPath);
-                    LogDebug("Extracting Models...");
-                    ZipFile.ExtractToDirectory(zipPath, rootPath);
-                    File.Delete(zipPath);
-                }
-                catch (Exception ex) { LogDebug("Error: " + ex.Message); }
-            }
+            using var http = new HttpClient();
+            var bytes = http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            File.WriteAllBytes(zipPath, bytes);
+            ZipFile.ExtractToDirectory(zipPath, rootPath, overwriteFiles: true);
+            File.Delete(zipPath);
         }
+
+        private static void GetOrCreateWipe(string wipeId)
+        {
+            _entitiesByWipe.GetOrAdd(wipeId, static _ => new ConcurrentDictionary<ulong, TrackedEntity>());
+        }
+
+        private static bool HasAuth(HttpListenerContext context, bool index = false)
+        {
+            string? authCookie = null;
+            CookieCollection cookies = context.Request.Cookies;
+            foreach (Cookie cookie in cookies)
+            {
+                if (cookie.Name == "auth")
+                {
+                    authCookie = cookie.Value;
+                    break;
+                }
+            }
+            if (string.IsNullOrEmpty(authCookie) || authCookie != _authToken)
+            {
+                if (!index)
+                {
+                    using var _ = SendJsonResponse(context.Response, 401, new { error = "Unauthorized" });
+                }
+                return false;
+            }
+            return true;
+        }
+
+        private static readonly JsonSerializerOptions _jsonOptions = new()
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            PropertyNameCaseInsensitive = true
+        };
 
         private static async Task SendJsonResponse(HttpListenerResponse response, int statusCode, object data)
         {
             response.StatusCode = statusCode;
             response.ContentType = "application/json";
-            string json = JsonConvert.SerializeObject(data);
-            byte[] buffer = Encoding.UTF8.GetBytes(json);
-            response.ContentLength64 = buffer.Length;
-            await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            byte[] jsonBytes = JsonSerializer.SerializeToUtf8Bytes(data, _jsonOptions);
+            response.ContentLength64 = jsonBytes.Length;
+            await response.OutputStream.WriteAsync(jsonBytes, 0, jsonBytes.Length);
         }
 
         private static void PrintStatistics()
@@ -1506,21 +2018,15 @@ namespace RustRelayReceiver
                 ClearLine();
                 Console.Write($"[STATS] Uptime: {GetUptimeSeconds():F0}s | WebSockets: {_webSocketClients.Count} | Packets: {Interlocked.Read(ref _totalPacketsReceived)}");
 
-                lock (_serversLock)
+                foreach (var server in _connectedServers.Values)
                 {
-                    foreach (var server in _connectedServers)
-                    {
-                        MoveCursor(row++);
-                        ClearLine();
-
-                        string connectedStr = FormatReadableTime(now - server.connectedAt);
-                        string activeStr = FormatReadableTime(now - server.lastActivity);
-
-                        Console.Write($"[Server] ID: {server.wipeId} | Up: {connectedStr} | Active: {activeStr} | Data: {FormatBytes(server.bytesReceived)}");
-                    }
+                    MoveCursor(row++);
+                    ClearLine();
+                    string connectedStr = FormatReadableTime(now - server.connectedAt);
+                    string activeStr = FormatReadableTime(now - server.lastActivity);
+                    Console.Write($"[Server] ID: {server.wipeId} | Up: {connectedStr} | Active: {activeStr} | Data: {FormatBytes(server.bytesReceived)}");
                 }
 
-                // Clear any leftover old header lines
                 for (int i = row; i < _headerHeight; i++)
                 {
                     MoveCursor(i);
@@ -1534,12 +2040,17 @@ namespace RustRelayReceiver
 
         public static void LogDebug(string message)
         {
+#if DEBUG
             lock (_consoleLock)
             {
                 MoveCursor(_headerHeight);
                 ClearLine();
-                Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}");
+                string msg = $"[{DateTime.Now:HH:mm:ss}] {message}";
+                Console.WriteLine(msg);
+                try { File.AppendAllText(Path.Combine(DataDirectory, "log.txt"), $"{msg}{System.Environment.NewLine}"); }
+                catch { }
             }
+#endif
         }
 
         private static void ClearLine()
@@ -1577,21 +2088,16 @@ namespace RustRelayReceiver
 
         private static void StopAll()
         {
-            lock (_clientsLock)
+            foreach (var kvp in _webSocketClients)
             {
-                foreach (var client in _webSocketClients)
+                var client = kvp.Key;
+                try
                 {
-                    try
-                    {
-                        client?.Socket?.CloseAsync(
-                            System.Net.WebSockets.WebSocketCloseStatus.NormalClosure,
-                            "Server shutdown",
-                            CancellationToken.None).Wait(1000);
-                    }
-                    catch { }
+                    client.Socket?.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Server shutdown", CancellationToken.None).Wait(1000);
                 }
-                _webSocketClients.Clear();
+                catch { }
             }
+            _webSocketClients.Clear();
             _httpListener.Stop();
             _httpListener.Close();
         }
@@ -1630,39 +2136,27 @@ namespace RustRelayReceiver
         private static void TrackServerActivity(string? wipeId)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
-            lock (_serversLock)
+            GetOrCreateWipe(wipeId);
+
+            var server = _connectedServers.GetOrAdd(wipeId, id => new ServerInfo
             {
-                var server = _connectedServers.FirstOrDefault(s => s.wipeId == wipeId);
-                if (server == null)
-                {
-                    server = new ServerInfo
-                    {
-                        wipeId = wipeId,
-                        connectedAt = DateTime.UtcNow,
-                        lastActivity = DateTime.UtcNow
-                    };
-                    _connectedServers.Add(server);
-                    LogDebug($"[SERVER] New server tracked: {wipeId}");
-                }
-                else
-                {
-                    server.lastActivity = DateTime.UtcNow;
-                }
-            }
+                wipeId = id,
+                connectedAt = DateTime.UtcNow,
+                lastActivity = DateTime.UtcNow
+            });
+            server.lastActivity = DateTime.UtcNow;
         }
 
         private static void UpdateServerStats(string? wipeId, int bytesReceived)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
-            lock (_serversLock)
+
+            var server = GetServerByWipeId(wipeId);
+            if (server != null)
             {
-                var server = _connectedServers.FirstOrDefault(s => s.wipeId == wipeId);
-                if (server != null)
-                {
-                    server.packetsReceived++;
-                    server.bytesReceived += bytesReceived;
-                    server.lastActivity = DateTime.UtcNow;
-                }
+                server.packetsReceived++;
+                server.bytesReceived += bytesReceived;
+                server.lastActivity = DateTime.UtcNow;
             }
         }
 
@@ -1670,26 +2164,27 @@ namespace RustRelayReceiver
         {
             if (string.IsNullOrEmpty(wipeId)) return;
 
-            lock (_serversLock)
+            var server = GetServerByWipeId(wipeId);
+            if (server != null)
             {
-                var server = _connectedServers.FirstOrDefault(s => s.wipeId == wipeId);
-                if (server != null)
-                {
-                    if (!server.receivedFiles.Contains(fileType)) { server.receivedFiles.Add(fileType); }
-                    server.lastActivity = DateTime.UtcNow;
-                }
+                if (!server.receivedFiles.Contains(fileType))
+                    server.receivedFiles.Add(fileType);
+                server.lastActivity = DateTime.UtcNow;
             }
         }
 
         private static string? GetStringFromPool(string? wipeId, uint id)
         {
-            lock (_stringPoolLock)
-            {
-                if (_globalStringPool.TryGetValue(id, out string? cachedValue)) { return cachedValue; }
-                LoadWipeStringToGlobalPool(wipeId);
-                if (_globalStringPool.TryGetValue(id, out string? newValue)) { return newValue; }
-                return SearchAllWipesForId(id);
-            }
+            if (_globalStringPool.TryGetValue(id, out var global))
+                return global;
+
+            if (wipeId != null && _wipeStringPools.TryGetValue(wipeId, out var pool))
+                if (pool.TryGetValue(id, out var value))
+                    return value;
+
+            LoadWipeStringToGlobalPool(wipeId);
+            _globalStringPool.TryGetValue(id, out var result);
+            return result;
         }
 
         private static void LoadWipeStringToGlobalPool(string? wipeId)
@@ -1697,43 +2192,31 @@ namespace RustRelayReceiver
             if (wipeId == null) return;
             string stringPoolsDir = Path.Combine(DataDirectory, wipeId, "StringPools");
             if (!Directory.Exists(stringPoolsDir)) return;
-            var latestFile = Directory.GetFiles(stringPoolsDir, "*.json").Select(f => new FileInfo(f)).OrderByDescending(f => f.LastWriteTimeUtc).FirstOrDefault();
+            var latestFile = Directory.EnumerateFiles(stringPoolsDir, "*.json").FirstOrDefault();
             if (latestFile == null) { return; }
             try
             {
-                foreach (string line in File.ReadAllLines(latestFile.FullName))
+                foreach (string line in File.ReadAllLines(latestFile))
                 {
                     int colonIndex = line.IndexOf(':');
                     if (colonIndex <= 0) { continue; }
-                    string keyPart = line.Substring(0, colonIndex).Trim(' ', '"');
-                    string valuePart = line.Substring(colonIndex + 1).Trim(' ', '"', ',', '\r', '\n');
+                    string keyPart = line[..colonIndex].Trim(' ', '"');
+                    string valuePart = line[(colonIndex + 1)..].Trim(' ', '"', ',', '\r', '\n');
                     if (uint.TryParse(keyPart, out uint parsedId) && !string.IsNullOrEmpty(valuePart))
                     {
                         if (!_globalStringPool.ContainsKey(parsedId)) { _globalStringPool[parsedId] = valuePart; }
                     }
                 }
             }
-            catch (Exception ex) { LogDebug($"[StringPool] Error loading {latestFile.Name}: {ex.Message}"); }
+            catch (Exception ex) { LogDebug($"[StringPool] Error loading {latestFile}: {ex.Message}"); }
         }
 
-        private static string? SearchAllWipesForId(uint id)
-        {
-            var wipeDirs = Directory.GetDirectories(DataDirectory);
-            foreach (var dir in wipeDirs)
-            {
-                string currentWipeId = Path.GetFileName(dir);
-                LoadWipeStringToGlobalPool(currentWipeId);
-                if (_globalStringPool.TryGetValue(id, out string? found)) { return found; }
-            }
-            return null;
-        }
-
-        public static string CompressAndEncode(byte[] data)
+        public static string CompressAndEncode(byte[]? data)
         {
             if (data == null || data.Length == 0) { return string.Empty; }
             using (var outputStream = new MemoryStream())
             {
-                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.Optimal, true)) { gZipStream.Write(data, 0, data.Length); }
+                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.SmallestSize, true)) { gZipStream.Write(data, 0, data.Length); }
                 return Convert.ToBase64String(outputStream.GetBuffer(), 0, (int)outputStream.Length);
             }
         }
@@ -1742,8 +2225,9 @@ namespace RustRelayReceiver
         {
             if (data == null || data.Length == 0) return null;
             int srcRes = (int)Math.Sqrt(data.Length / stepSize);
-            int dstRes = srcRes / 2;
-            if (dstRes < 64) dstRes = 64;
+            if (srcRes <= 2049) return data;
+            int dstRes = ((srcRes - 1) / 2) + 1;
+            if (dstRes < 512) dstRes = 512;
             int dstSize = dstRes * dstRes * stepSize;
             byte[] result = new byte[dstSize];
             float ratio = (float)(srcRes - 1) / (dstRes - 1);
@@ -1760,6 +2244,7 @@ namespace RustRelayReceiver
             }
             return result;
         }
+
         private static string? ExtractFormName(string headers)
         {
             int nameIndex = headers.IndexOf("name=\"");
@@ -1767,7 +2252,7 @@ namespace RustRelayReceiver
             {
                 int start = nameIndex + 6;
                 int end = headers.IndexOf("\"", start);
-                if (end > start) { return headers.Substring(start, end - start); }
+                if (end > start) { return headers[start..end]; }
             }
 
             nameIndex = headers.IndexOf("name=", StringComparison.OrdinalIgnoreCase);
@@ -1784,7 +2269,7 @@ namespace RustRelayReceiver
                     end++;
                 }
                 while (end > start && (headers[end - 1] == ' ' || headers[end - 1] == '\t')) { end--; }
-                if (end > start) { return headers.Substring(start, end - start); }
+                if (end > start) { return headers[start..end]; }
             }
             return null;
         }
@@ -1805,32 +2290,20 @@ namespace RustRelayReceiver
                     end++;
                 }
                 while (end > start && (headers[end - 1] == ' ' || headers[end - 1] == '\t')) { end--; }
-                if (end > start) { return headers.Substring(start, end - start); }
+                if (end > start) { return headers[start..end]; }
             }
             return null;
         }
 
-        private static int FindBytes(byte[] haystack, byte[] needle, int startPos)
+        private static int FindBytes(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle, int startPos)
         {
-            if (haystack == null || needle == null) { return -1; }
-            if (needle.Length == 0) { return startPos; }
-            if (haystack.Length == 0) { return -1; }
-            if (startPos < 0) { startPos = 0; }
-            if (startPos >= haystack.Length) { return -1; }
-            for (int i = startPos; i <= haystack.Length - needle.Length; i++)
-            {
-                bool found = true;
-                for (int j = 0; j < needle.Length; j++)
-                {
-                    if (haystack[i + j] != needle[j])
-                    {
-                        found = false;
-                        break;
-                    }
-                }
-                if (found) return i;
-            }
-            return -1;
+            if (needle.Length == 0) return startPos;
+            if (startPos < 0) startPos = 0;
+            if (startPos >= haystack.Length) return -1;
+
+            var searchSpace = haystack[startPos..];
+            int idx = searchSpace.IndexOf(needle);
+            return idx >= 0 ? idx + startPos : -1;
         }
 
         private static void SaveMapFileToDirectory(string wipeId, string filename, byte[] data)
@@ -1855,9 +2328,9 @@ namespace RustRelayReceiver
                 if (!Directory.Exists(mapsDir)) return null;
                 var mapFiles = Directory.GetFiles(mapsDir, "*.map");
                 if (mapFiles.Length == 0) return null;
-                string latestMapFile = mapFiles.Select(f => new FileInfo(f)).OrderByDescending(f => f.LastWriteTimeUtc).First().FullName;
-                string cacheKey = $"{wipeId}:{latestMapFile}";
-                if (_mapCache.TryGetValue(cacheKey, out var cached) && cached.loadedAt > DateTime.UtcNow.AddMinutes(-MAP_CACHE_TTL_MINUTES) && cached.filePath == latestMapFile)
+                string? latestMapFile = Directory.EnumerateFiles(mapsDir, "*.map").FirstOrDefault();
+                if (latestMapFile is null) { return null; }
+                if (_mapCache.TryGetValue(wipeId, out var cached) && cached.loadedAt > DateTime.UtcNow.AddMinutes(-MAP_CACHE_TTL_MINUTES) && cached.filePath == latestMapFile)
                 {
                     LogDebug($"[MAP CACHE] Hit for {wipeId}");
                     return cached.ws;
@@ -1865,7 +2338,7 @@ namespace RustRelayReceiver
                 LogDebug($"[MAP CACHE] Miss for {wipeId}, loading: {latestMapFile}");
                 var ws = new WorldSerialization();
                 ws.Load(latestMapFile);
-                _mapCache[cacheKey] = (ws, DateTime.UtcNow, latestMapFile);
+                _mapCache[wipeId] = (ws, DateTime.UtcNow, latestMapFile);
                 return ws;
             }
         }
@@ -1877,31 +2350,28 @@ namespace RustRelayReceiver
             int start = nameIndex + 10;
             int end = headers.IndexOf("\"", start);
             if (end < 0) { return null; }
-            return headers.Substring(start, end - start);
+            return headers[start..end];
         }
 
-        private static void SaveStringPoolToFile(string? wipeId, Dictionary<uint, string> stringPool)
+        private static async Task SaveStringPoolToFile(string? wipeId, Dictionary<uint, string> stringPool)
         {
+            if (wipeId == null) return;
             try
             {
-                string filename = $"stringpool.json";
-                if (wipeId == null) { return; }
-                string filepath = Path.Combine(DataDirectory, wipeId, "StringPools", SanitizeFilename(filename));
-                var sb = new StringBuilder();
-                sb.AppendLine("{");
-                bool first = true;
-                foreach (var kvp in stringPool.OrderBy(x => x.Key))
+                var filepath = Path.Combine(DataDirectory, wipeId, "StringPools", "stringpool.json");
+                await _fileWriteSemaphore.WaitAsync();
+                try
                 {
-                    if (!first) sb.AppendLine(",");
-                    first = false;
-                    sb.Append($"  \"{kvp.Key}\": \"{EscapeJsonString(kvp.Value)}\"");
+                    var sb = new StringBuilder();
+                    sb.AppendLine("{");
+                    sb.AppendJoin(",\n", stringPool.OrderBy(x => x.Key)
+                        .Select(kvp => $"  \"{kvp.Key}\": \"{EscapeJsonString(kvp.Value)}\""));
+                    sb.AppendLine("\n}");
+                    await File.WriteAllTextAsync(filepath, sb.ToString());
                 }
-                sb.AppendLine();
-                sb.AppendLine("}");
-                lock (FileWriteLock) { File.WriteAllText(filepath, sb.ToString()); }
-                LogDebug($"[STORAGE] StringPool saved: {wipeId}");
+                finally { _fileWriteSemaphore.Release(); }
             }
-            catch (Exception ex) { LogDebug($"[STORAGE] Failed to save StringPool: {ex.Message}"); }
+            catch (Exception ex) { LogDebug($"[STORAGE] Failed: {ex.Message}"); }
         }
 
         private static void SaveManifestToFile(string? wipeId, Dictionary<uint, string> manifest)
@@ -1946,15 +2416,6 @@ namespace RustRelayReceiver
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Snapshot: {ex.Message}"); }
         }
 
-        private static string ComputeChecksum(byte[] data)
-        {
-            using (var sha256 = System.Security.Cryptography.SHA256.Create())
-            {
-                byte[] hash = sha256.ComputeHash(data);
-                return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-            }
-        }
-
         private static string SanitizeFilename(string filename)
         {
             char[] invalid = Path.GetInvalidFileNameChars();
@@ -1967,8 +2428,8 @@ namespace RustRelayReceiver
             if (s == null) { return ""; }
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("\t", "\\t");
         }
-        #endregion
     }
+    #endregion
 
     #region Classes
     public static class SimpleJsonParser
@@ -1979,17 +2440,16 @@ namespace RustRelayReceiver
             json = json.Trim();
             if (json.StartsWith("{") && json.EndsWith("}"))
             {
-                json = json.Substring(1, json.Length - 2);
+                json = json[1..^1];
                 var pairs = SplitJsonObjects(json);
                 foreach (var pair in pairs)
                 {
                     int colonIndex = pair.IndexOf(':');
                     if (colonIndex > 0)
                     {
-                        string keyStr = pair.Substring(0, colonIndex).Trim().Trim('"');
-                        string valueStr = pair.Substring(colonIndex + 1).Trim().Trim('"');
-                        uint key;
-                        if (uint.TryParse(keyStr, out key)) { result[key] = valueStr; }
+                        string keyStr = pair[..colonIndex].Trim().Trim('"');
+                        string valueStr = pair[(colonIndex + 1)..].Trim().Trim('"');
+                        if (uint.TryParse(keyStr, out uint key)) { result[key] = valueStr; }
                     }
                 }
             }
@@ -2013,19 +2473,227 @@ namespace RustRelayReceiver
                     else if (c == '}' || c == ']') { depth--; }
                     else if (c == ',' && depth == 0)
                     {
-                        result.Add(json.Substring(start, i - start));
+                        result.Add(json[start..i]);
                         start = i + 1;
                     }
                 }
             }
-            if (start < json.Length) { result.Add(json.Substring(start)); }
+            if (start < json.Length) { result.Add(json[start..]); }
             return result;
+        }
+    }
+
+    public sealed class EffectData
+    {
+        public int type;
+        public uint pooledstringid;
+        public int number;
+        public Vector3? origin;
+        public Vector3? normal;
+        public float scale;
+        public ulong entity;
+        public uint bone;
+        public ulong source;
+        public float distanceOverride;
+        public bool ignoreMaxSpawnDistance;
+        public ulong sourceEntity;
+    }
+
+    public struct BaseNetworkable
+    {
+        public NetworkableId uid;
+        public uint prefabID;
+        public uint group;
+    }
+
+    public enum Wire
+    {
+        Varint = 0,
+        Fixed64 = 1,
+        LengthDelimited = 2,
+        StartGroup = 3,
+        EndGroup = 4,
+        Fixed32 = 5
+    }
+
+    public struct Key
+    {
+        public uint Field;
+        public Wire WireType;
+        public Key(uint field, Wire wireType) { Field = field; WireType = wireType; }
+    }
+
+    public struct Entity { public BaseNetworkable? baseNetworkable; }
+
+    [Flags]
+    public enum Flags : int
+    {
+        Placeholder = 1, On = 2, OnFire = 4, Open = 8, Locked = 16, Debugging = 32,
+        Disabled = 64, Reserved1 = 128, Reserved2 = 256, Reserved3 = 512, Reserved4 = 1024,
+        Reserved5 = 2048, Broken = 4096, Busy = 8192, Reserved6 = 16384, Reserved7 = 32768,
+        Reserved8 = 65536, Reserved9 = 131072, Reserved10 = 262144, Reserved11 = 524288,
+        InUse = 1048576, Reserved12 = 2097152, Reserved13 = 4194304, Unused23 = 8388608,
+        Protected = 16777216, Transferring = 33554432, Reserved14 = 67108864, Reserved15 = 134217728,
+        Reserved16 = 268435456, Reserved17 = 536870912, Reserved18 = 1073741824,
+        Reserved19 = unchecked((int)0x80000000)
+    }
+
+    public sealed class TrackedEntity
+    {
+        public ulong Id;
+        public uint PrefabId;
+        public string? PrefabName = "";
+        public uint GroupId;
+        public Vector3? pos;
+        public Vector3? rot;
+        public int Flags;
+        public bool isDestroyed = false;
+
+        public TrackedEntity() { }
+
+        public void UpdatePosition(float px, float py, float pz, float rx, float ry, float rz)
+        {
+            pos = new Vector3(px, py, pz);
+            rot = new Vector3(rx, ry, rz);
+        }
+
+        public void UpdateFlags(int flags)
+        {
+            Flags = flags;
+        }
+    }
+
+    public sealed class TrackedEffect
+    {
+        public ulong Id;
+        public string? PrefabName = "";
+        public Vector3? pos;
+
+        public TrackedEffect() { }
+
+        public void UpdatePosition(float px, float py, float pz)
+        {
+            pos = new Vector3(px, py, pz);
+        }
+    }
+
+    public static class ProtoVector3
+    {
+        public static Vector3 Deserialize(byte[] data) => Deserialize(data.AsSpan());
+
+        public static Vector3 Deserialize(ReadOnlySpan<byte> data)
+        {
+            float x = 0, y = 0, z = 0;
+            int offset = 0;
+
+            while (offset < data.Length)
+            {
+                uint tag = ReadVarUInt32(data, ref offset);
+                uint field = tag >> 3;
+                uint wire = tag & 7;
+
+                switch (field)
+                {
+                    case 1: x = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
+                    case 2: y = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
+                    case 3: z = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
+                    default: SkipWire(data, ref offset, wire); break;
+                }
+            }
+            return new Vector3(x, y, z);
+        }
+
+        private static uint ReadVarUInt32(ReadOnlySpan<byte> data, ref int index)
+        {
+            uint result = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = data[index++];
+                result |= (uint)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) return result;
+                shift += 7;
+            }
+        }
+
+        private static void SkipWire(ReadOnlySpan<byte> data, ref int index, uint wire)
+        {
+            switch (wire)
+            {
+                case 0: while ((data[index++] & 0x80) != 0) { } break;
+                case 1: index += 8; break;
+                case 2: index += (int)ReadVarUInt32(data, ref index); break;
+                case 5: index += 4; break;
+                default: throw new Exception("Bad wire type");
+            }
+        }
+    }
+
+    public ref struct ProtoReader
+    {
+        private readonly ReadOnlySpan<byte> _buffer;
+        private int _pos;
+
+        public ProtoReader(ReadOnlySpan<byte> buffer) { _buffer = buffer; _pos = 0; }
+
+        public readonly bool EOF => _pos >= _buffer.Length;
+
+        public uint ReadTag() => EOF ? 0 : ReadVarUInt32();
+
+        public uint ReadVarUInt32()
+        {
+            uint result = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = _buffer[_pos++];
+                result |= (uint)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+            }
+            return result;
+        }
+
+        public ulong ReadVarUInt64()
+        {
+            ulong result = 0;
+            int shift = 0;
+            while (true)
+            {
+                byte b = _buffer[_pos++];
+                result |= (ulong)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+            }
+            return result;
+        }
+
+        public float ReadFixed32() => BinaryPrimitives.ReadSingleLittleEndian(_buffer[_pos..]);
+
+        public byte[] ReadBytes()
+        {
+            int length = (int)ReadVarUInt32();
+            var data = new byte[length];
+            _buffer.Slice(_pos, length).CopyTo(data);
+            _pos += length;
+            return data;
+        }
+
+        public void Skip(uint wireType)
+        {
+            switch (wireType)
+            {
+                case 0: ReadVarUInt64(); break;
+                case 1: _pos += 8; break;
+                case 2: _pos += (int)ReadVarUInt32(); break;
+                case 5: _pos += 4; break;
+                default: throw new InvalidOperationException($"Unknown wire type: {wireType}");
+            }
         }
     }
 
     public static class ProtoPacketProcessor
     {
-        #region Enums
         public enum MessageType : byte
         {
             First,
@@ -2062,688 +2730,34 @@ namespace RustRelayReceiver
             DemoDisconnection = 50,
             DemoTransientEntities
         }
-
-        #endregion
-
-        #region Structs
-        public struct NetworkableId : IEquatable<NetworkableId>
-        {
-            public ulong Value { get; set; }
-            public bool IsValid => Value > 0;
-            public static NetworkableId Empty => new(0);
-
-            public NetworkableId(ulong value)
-            {
-                Value = value;
-            }
-
-            public bool Equals(NetworkableId other) => Value == other.Value;
-            public override bool Equals(object? obj) => obj is NetworkableId other && Equals(other);
-            public override int GetHashCode() => Value.GetHashCode();
-            public static bool operator ==(NetworkableId left, NetworkableId right) => left.Equals(right);
-            public static bool operator !=(NetworkableId left, NetworkableId right) => !left.Equals(right);
-            public override string ToString() => Value.ToString("G");
-        }
-
-        public struct Packet
-        {
-            public bool IsValid => Size > 0;
-            public long Position { get; set; }
-            public int Size { get; set; }
-            public long Time { get; set; }
-            public byte[] Data { get; set; }
-
-            public Packet(long position, int size, long time, byte[] data)
-            {
-                Position = position;
-                Size = size;
-                Time = time;
-                Data = data;
-            }
-        }
-
-        #endregion
-
-        #region Data Models
-
-        public class BaseNetworkable
-        {
-            public NetworkableId uid { get; set; }
-            public uint prefabId { get; set; }
-        }
-
-        public class BaseEntity
-        {
-            public NetworkableId uid { get; set; }
-            public uint prefabId { get; set; }
-            public Vector3? position { get; set; }
-            public Vector3? rotation { get; set; }
-            public ulong ownerId { get; set; }
-            public uint flags { get; set; }
-        }
-
-        public class BasePlayer
-        {
-            public NetworkableId uid { get; set; }
-            public uint prefabId { get; set; }
-            public Vector3? position { get; set; }
-            public Vector3? rotation { get; set; }
-            public string name { get; set; } = string.Empty;
-            public ulong userId { get; set; }
-            public uint health { get; set; }
-            public uint maxHealth { get; set; }
-        }
-
-        public class Entity
-        {
-            public BaseNetworkable? baseNetworkable { get; set; }
-            public BaseEntity? baseEntity { get; set; }
-            public BasePlayer? basePlayer { get; set; }
-        }
-
-        public class EntityPositionUpdate
-        {
-            public NetworkableId EntityId { get; set; }
-            public Vector3? Position { get; set; }
-            public Vector3? Rotation { get; set; }
-        }
-
-        public class EntityDestroyEvent
-        {
-            public NetworkableId EntityId { get; set; }
-        }
-
-        public class RPCMessageData
-        {
-            public NetworkableId TargetEntity { get; set; }
-            public uint RPCId { get; set; }
-            public byte[] Data { get; set; } = Array.Empty<byte>();
-        }
-
-        public class VoiceDataInfo
-        {
-            public NetworkableId PlayerId { get; set; }
-            public byte[] AudioData { get; set; } = Array.Empty<byte>();
-        }
-
-        public class EffectData
-        {
-            public string EffectName { get; set; } = string.Empty;
-            public Vector3? Position { get; set; }
-            public Vector3? Direction { get; set; }
-            public uint EntityId { get; set; }
-        }
-
-        #endregion
-
-        #region Event Args
-
-        public class EntityEventArgs : EventArgs
-        {
-            public Entity Entity { get; set; } = new();
-        }
-
-        public class PositionUpdateEventArgs : EventArgs
-        {
-            public NetworkableId EntityId { get; set; }
-            public Vector3? Position { get; set; }
-            public Vector3? Rotation { get; set; }
-        }
-
-        public class EntityDestroyEventArgs : EventArgs
-        {
-            public NetworkableId EntityId { get; set; }
-        }
-
-        public class RPCMessageEventArgs : EventArgs
-        {
-            public NetworkableId TargetEntity { get; set; }
-            public uint RPCId { get; set; }
-            public byte[] Data { get; set; } = Array.Empty<byte>();
-        }
-
-        public class VoiceDataEventArgs : EventArgs
-        {
-            public NetworkableId PlayerId { get; set; }
-            public byte[] AudioData { get; set; } = Array.Empty<byte>();
-        }
-
-        public class EffectEventArgs : EventArgs
-        {
-            public string EffectName { get; set; } = string.Empty;
-            public Vector3? Position { get; set; }
-            public Vector3? Direction { get; set; }
-            public uint EntityId { get; set; }
-        }
-
-        public class EntityFlagsEventArgs : EventArgs
-        {
-            public NetworkableId EntityId { get; set; }
-            public uint Flags { get; set; }
-        }
-
-        #endregion
-
-        #region Packet.Handler
-
-        public class PacketHandler : IDisposable
-        {
-            private long _packetCount;
-            private long _lastPacketTime;
-            private readonly Dictionary<NetworkableId, Entity> _entities = new();
-            private readonly HashSet<NetworkableId> _updatedEntities = new();
-
-            public long PacketCount => _packetCount;
-
-            public long LastPacketTime => _lastPacketTime;
-
-            public IReadOnlyDictionary<NetworkableId, Entity> Entities => _entities;
-
-            #region Events
-
-            public event EventHandler<EntityEventArgs>? EntityReceived;
-            public event EventHandler<PositionUpdateEventArgs>? EntityPositionUpdated;
-            public event EventHandler<EntityDestroyEventArgs>? EntityDestroyed;
-            public event EventHandler<RPCMessageEventArgs>? RPCMessageReceived;
-            public event EventHandler<VoiceDataEventArgs>? VoiceDataReceived;
-            public event EventHandler<EffectEventArgs>? EffectReceived;
-            public event EventHandler<EntityFlagsEventArgs>? EntityFlagsUpdated;
-            public event EventHandler<(MessageType Type, byte[] Data)>? UnknownPacketReceived;
-
-            #endregion
-
-            public Packet? ReadPacket(Stream stream)
-            {
-                try
-                {
-                    if (stream.Position >= stream.Length)
-                        return null;
-
-                    long position = ReadInt64(stream);
-                    int size = ReadInt32(stream);
-                    long time = ReadInt64(stream);
-
-                    if (size <= 0 || size > 10_000_000)
-                        return null;
-
-                    byte[] data = new byte[size];
-                    int bytesRead = 0;
-                    while (bytesRead < size)
-                    {
-                        int read = stream.Read(data, bytesRead, size - bytesRead);
-                        if (read == 0)
-                            return null;
-                        bytesRead += read;
-                    }
-
-                    return new Packet(position, size, time, data);
-                }
-                catch (EndOfStreamException)
-                {
-                    return null;
-                }
-            }
-
-            public void ProcessPacket(Packet packet)
-            {
-                _packetCount++;
-                _lastPacketTime = Math.Max(_lastPacketTime, packet.Time);
-
-                using var stream = new MemoryStream(packet.Data);
-                using var reader = new BinaryReader(stream);
-
-                if (stream.Position >= stream.Length)
-                    return;
-
-                byte typeByte = reader.ReadByte();
-
-                if (typeByte > 140)
-                {
-                    typeByte -= 140;
-
-                    if (typeByte <= 28)
-                    {
-                        switch (typeByte)
-                        {
-                            case 5:
-                                ReadEntities(reader);
-                                break;
-                            case 6:
-                                ReadEntityDestroy(reader);
-                                break;
-                            case 9:
-                                ReadRPCMessage(reader);
-                                break;
-                            case 10:
-                                ReadEntityPosition(reader);
-                                break;
-                            default:
-                                UnknownPacketReceived?.Invoke(this, ((MessageType)typeByte, packet.Data));
-                                break;
-                        }
-                    }
-                }
-            }
-
-            public void HandleNetworkPacket(MessageType type, byte[] packet, string wipeId)
-            {
-                _packetCount++;
-                switch (type)
-                {
-                    case MessageType.Entities:
-                        HandleEntities(packet, wipeId);
-                        break;
-
-                    case MessageType.EntityPosition:
-                        HandleEntityPosition(packet, wipeId);
-                        break;
-
-                    case MessageType.EntityDestroy:
-                        HandleEntityDestroy(packet, wipeId);
-                        break;
-
-                    case MessageType.RPCMessage:
-                        HandleRPCMessage(packet, wipeId);
-                        break;
-
-                    case MessageType.VoiceData:
-                        HandleVoiceData(packet, wipeId);
-                        break;
-
-                    case MessageType.Effect:
-                        HandleEffect(packet, wipeId);
-                        break;
-
-                    case MessageType.EntityFlags:
-                        HandleEntityFlags(packet, wipeId);
-                        break;
-
-                    default:
-                        break;
-                }
-            }
-
-            #region Handlers
-
-            private void HandleEntities(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                while (stream.Position < stream.Length - 1)
-                {
-                    long startPos = stream.Position;
-                    byte firstByte = reader.ReadByte();
-                    if (firstByte == 0x08 || firstByte == 0x10 || firstByte == 0x09 || firstByte == 0x11)
-                    {
-                        stream.Position = startPos;
-                        break;
-                    }
-                }
-                var entity = ReadEntity(reader);
-                if (entity?.baseNetworkable != null)
-                {
-                    var entityId = entity.baseNetworkable.uid;
-                    MarkEntityUpdated(entityId);
-                    _entities[entityId] = entity;
-                    EntityReceived?.Invoke(this, new EntityEventArgs { Entity = entity });
-                }
-            }
-
-            private void HandleEntityPosition(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                var entityId = new NetworkableId(reader.ReadUInt64());
-                var position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                var rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                MarkEntityUpdated(entityId);
-                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
-                {
-                    entity.baseEntity.position = position;
-                    entity.baseEntity.rotation = rotation;
-                }
-                EntityPositionUpdated?.Invoke(this, new PositionUpdateEventArgs
-                {
-                    EntityId = entityId,
-                    Position = position,
-                    Rotation = rotation
-                });
-            }
-
-            private void HandleEntityDestroy(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                var entityId = new NetworkableId(reader.ReadUInt64());
-                _entities.Remove(entityId);
-                MarkEntityUpdated(entityId);
-                EntityDestroyed?.Invoke(this, new EntityDestroyEventArgs { EntityId = entityId });
-            }
-
-            private void HandleRPCMessage(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                var targetEntity = new NetworkableId(reader.ReadUInt64());
-                var rpcId = reader.ReadUInt32();
-                var data = reader.ReadBytes((int)(stream.Length - stream.Position));
-                RPCMessageReceived?.Invoke(this, new RPCMessageEventArgs
-                {
-                    TargetEntity = targetEntity,
-                    RPCId = rpcId,
-                    Data = data
-                });
-            }
-
-            private void HandleVoiceData(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                var playerId = new NetworkableId(reader.ReadUInt64());
-                var audioData = reader.ReadBytes((int)(stream.Length - stream.Position));
-                VoiceDataReceived?.Invoke(this, new VoiceDataEventArgs
-                {
-                    PlayerId = playerId,
-                    AudioData = audioData
-                });
-            }
-
-            private void HandleEffect(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                string effectName = string.Empty;
-                Vector3 position = Vector3.Zero;
-                Vector3 direction = Vector3.Zero;
-                uint entityId = 0;
-                try
-                {
-                    if (stream.Position < stream.Length)
-                    {
-                        int nameLength = reader.ReadByte();
-                        if (nameLength > 0 && stream.Position + nameLength <= stream.Length)
-                        {
-                            byte[] nameBytes = reader.ReadBytes(nameLength);
-                            effectName = Encoding.UTF8.GetString(nameBytes);
-                        }
-                    }
-                    if (stream.Position + 12 <= stream.Length)
-                    {
-                        position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                    }
-                    if (stream.Position + 12 <= stream.Length)
-                    {
-                        direction = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                    }
-                    if (stream.Position < stream.Length)
-                    {
-                        entityId = ReadVarUInt32(reader);
-                    }
-                }
-                catch { /* Parsing failed */ }
-
-                EffectReceived?.Invoke(this, new EffectEventArgs
-                {
-                    EffectName = effectName,
-                    Position = position,
-                    Direction = direction,
-                    EntityId = entityId
-                });
-            }
-
-            private void HandleEntityFlags(byte[] packet, string wipeId)
-            {
-                using var stream = new MemoryStream(packet);
-                using var reader = new BinaryReader(stream);
-                var entityId = new NetworkableId(reader.ReadUInt64());
-                var flags = reader.ReadUInt32();
-                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
-                {
-                    entity.baseEntity.flags = flags;
-                }
-                EntityFlagsUpdated?.Invoke(this, new EntityFlagsEventArgs
-                {
-                    EntityId = entityId,
-                    Flags = flags
-                });
-            }
-
-            #endregion
-
-            #region Internal.Readers
-
-            private void ReadEntities(BinaryReader reader)
-            {
-                var stream = reader.BaseStream;
-                if (stream.Position >= stream.Length) { return; }
-
-                reader.ReadUInt32();
-                var entity = ReadEntity(reader);
-                if (entity?.baseNetworkable != null)
-                {
-                    var entityId = entity.baseNetworkable.uid;
-                    MarkEntityUpdated(entityId);
-                    _entities[entityId] = entity;
-                    EntityReceived?.Invoke(this, new EntityEventArgs { Entity = entity });
-                }
-            }
-
-            private void ReadEntityDestroy(BinaryReader reader)
-            {
-                var entityId = new NetworkableId(reader.ReadUInt32());
-                _entities.Remove(entityId);
-                MarkEntityUpdated(entityId);
-                EntityDestroyed?.Invoke(this, new EntityDestroyEventArgs { EntityId = entityId });
-            }
-
-            private void ReadEntityPosition(BinaryReader reader)
-            {
-                var entityId = new NetworkableId(reader.ReadUInt64());
-                var position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                var rotation = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-
-                MarkEntityUpdated(entityId);
-
-                if (_entities.TryGetValue(entityId, out var entity) && entity.baseEntity != null)
-                {
-                    entity.baseEntity.position = position;
-                    entity.baseEntity.rotation = rotation;
-                }
-
-                EntityPositionUpdated?.Invoke(this, new PositionUpdateEventArgs
-                {
-                    EntityId = entityId,
-                    Position = position,
-                    Rotation = rotation
-                });
-            }
-
-            private void ReadRPCMessage(BinaryReader reader)
-            {
-                var data = reader.ReadBytes((int)(reader.BaseStream.Length - reader.BaseStream.Position));
-                RPCMessageReceived?.Invoke(this, new RPCMessageEventArgs { Data = data });
-            }
-
-            private Entity? ReadEntity(BinaryReader reader)
-            {
-                var entity = new Entity();
-
-                try
-                {
-                    entity.baseNetworkable = ReadBaseNetworkable(reader);
-                }
-                catch
-                {
-                    // Entity parsing incomplete, return what we have
-                }
-
-                return entity;
-            }
-
-            private BaseNetworkable? ReadBaseNetworkable(BinaryReader reader)
-            {
-                var result = new BaseNetworkable();
-                var stream = reader.BaseStream;
-
-                while (stream.Position < stream.Length)
-                {
-                    byte tag = reader.ReadByte();
-                    int fieldNumber = tag >> 3;
-                    int wireType = tag & 0x07;
-
-                    switch (fieldNumber)
-                    {
-                        case 1: // uid
-                            if (wireType == 0)
-                                result.uid = new NetworkableId(ReadVarUInt64(reader));
-                            break;
-                        case 2: // prefabId
-                            if (wireType == 0)
-                                result.prefabId = ReadVarUInt32(reader);
-                            break;
-                        default:
-                            SkipField(reader, wireType);
-                            break;
-                    }
-                }
-
-                return result;
-            }
-
-            private void MarkEntityUpdated(NetworkableId entityId)
-            {
-                _updatedEntities.Add(entityId);
-            }
-
-            #endregion
-
-            #region Binary.Helpers
-
-            private static long ReadInt64(Stream stream)
-            {
-                byte[] buffer = new byte[8];
-                stream.Read(buffer, 0, 8);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(buffer);
-                return BitConverter.ToInt64(buffer, 0);
-            }
-
-            private static int ReadInt32(Stream stream)
-            {
-                byte[] buffer = new byte[4];
-                stream.Read(buffer, 0, 4);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(buffer);
-                return BitConverter.ToInt32(buffer, 0);
-            }
-
-            private static ulong ReadVarUInt64(BinaryReader reader)
-            {
-                ulong result = 0;
-                int shift = 0;
-                while (shift < 64)
-                {
-                    byte b = reader.ReadByte();
-                    result |= (ulong)(b & 0x7F) << shift;
-                    shift += 7;
-                    if ((b & 0x80) == 0) { break; }
-                }
-                return result;
-            }
-
-            private static uint ReadVarUInt32(BinaryReader reader)
-            {
-                uint result = 0;
-                int shift = 0;
-                while (shift < 32)
-                {
-                    byte b = reader.ReadByte();
-                    result |= (uint)(b & 0x7F) << shift;
-                    shift += 7;
-                    if ((b & 0x80) == 0) { break; }
-                }
-
-                return result;
-            }
-
-            private static void SkipField(BinaryReader reader, int wireType)
-            {
-                switch (wireType)
-                {
-                    case 0:
-                        reader.ReadByte();
-                        break;
-                    case 1:
-                        reader.ReadBytes(8);
-                        break;
-                    case 2:
-                        int len = (int)ReadVarUInt32(reader);
-                        reader.ReadBytes(len);
-                        break;
-                    case 5:
-                        reader.ReadBytes(4);
-                        break;
-                }
-            }
-
-            #endregion
-
-            public void Dispose()
-            {
-            }
-        }
-
-        #endregion
-
-        #region Static.Helper.Methods
-        public static PacketHandler CreateHandler(
-            Action<EntityEventArgs>? onEntity = null,
-            Action<PositionUpdateEventArgs>? onPositionUpdate = null,
-            Action<EntityDestroyEventArgs>? onEntityDestroy = null,
-            Action<RPCMessageEventArgs>? onRPC = null,
-            Action<VoiceDataEventArgs>? onVoice = null,
-            Action<EffectEventArgs>? onEffect = null,
-            Action<EntityFlagsEventArgs>? onEntityFlags = null)
-        {
-            var handler = new PacketHandler();
-            if (onEntity != null) handler.EntityReceived += (s, e) => onEntity(e);
-            if (onPositionUpdate != null) handler.EntityPositionUpdated += (s, e) => onPositionUpdate(e);
-            if (onEntityDestroy != null) handler.EntityDestroyed += (s, e) => onEntityDestroy(e);
-            if (onRPC != null) handler.RPCMessageReceived += (s, e) => onRPC(e);
-            if (onVoice != null) handler.VoiceDataReceived += (s, e) => onVoice(e);
-            if (onEffect != null) handler.EffectReceived += (s, e) => onEffect(e);
-            if (onEntityFlags != null) handler.EntityFlagsUpdated += (s, e) => onEntityFlags(e);
-            return handler;
-        }
-
-        #endregion
     }
 
     public class ServerInfo
     {
-        public string? wipeId;
-        public DateTime connectedAt;
-        public DateTime lastActivity;
-        public long packetsReceived;
-        public long bytesReceived;
-        public List<string> receivedFiles = new List<string>();
+        public string? wipeId { get; set; }
+        public DateTime connectedAt { get; set; }
+        public DateTime lastActivity { get; set; }
+        public long packetsReceived { get; set; }
+        public long bytesReceived { get; set; }
+        public List<string> receivedFiles { get; set; } = new();
     }
 
     public class MapInfo
     {
-        public int worldsize;
-        public int mapCount;
-        public int prefabCount;
-        public int pathCount;
-        public int customMonumentCount;
-        public List<string> mapNames = new List<string>();
-        public List<string> prefabCategories = new List<string>();
-        public Dictionary<string, int> prefabCategoryCounts = new Dictionary<string, int>();
-        public List<string> pathNames = new List<string>();
-        public List<object> customMonuments = new List<object>();
-        public long timestamp;
-        public string? png;
+        public int worldsize { get; set; }
+        public int mapCount { get; set; }
+        public int prefabCount { get; set; }
+        public int pathCount { get; set; }
+        public int customMonumentCount { get; set; }
+        public List<string> mapNames { get; set; } = new();
+        public List<string> prefabCategories { get; set; } = new();
+        public Dictionary<string, int> prefabCategoryCounts { get; set; } = new();
+        public List<string> pathNames { get; set; } = new();
+        public List<object> customMonuments { get; set; } = new();
+        public long timestamp { get; set; }
+        public string? png { get; set; }
     }
+
     #endregion
 
     #region Rust.World
@@ -2765,11 +2779,11 @@ namespace RustRelayReceiver
             return null;
         }
 
-        public List<MapData> GetCustomMonuments() { return world.maps.Where((MapData x) => x.name.StartsWith("CustomMonument_") || x.name.StartsWith(":")).ToList(); }
+        public List<MapData> GetCustomMonuments() { return world?.maps?.Where(x => x?.name != null && (x.name.StartsWith("CustomMonument_") || x.name.StartsWith(":"))).ToList() ?? new List<MapData>(); }
 
         public void AddMap(string name, byte[] data)
         {
-            MapData mapData = new MapData();
+            MapData mapData = new();
             mapData.name = name;
             mapData.data = data;
             world.maps.Add(mapData);
@@ -2885,7 +2899,7 @@ namespace RustRelayReceiver
             }
 
             [ProtoMember(1)]
-            public string name;
+            public string name = string.Empty;
 
             [ProtoMember(2)]
             public bool spline;
@@ -2927,7 +2941,7 @@ namespace RustRelayReceiver
             public int topology;
 
             [ProtoMember(15)]
-            public List<VectorData> nodes;
+            public List<VectorData> nodes = new();
 
             [ProtoMember(16)]
             public int hierarchy;
@@ -2953,6 +2967,14 @@ namespace RustRelayReceiver
             public VectorData scale;
         }
 
+        public struct NetworkableId : IEquatable<NetworkableId>
+        {
+            public ulong Value { get; set; }
+            public readonly bool IsValid => Value > 0;
+            public NetworkableId(ulong value) { Value = value; }
+            public readonly bool Equals(NetworkableId other) => Value == other.Value;
+        }
+
         public class Vector3
         {
             public float X { get; set; }
@@ -2965,17 +2987,13 @@ namespace RustRelayReceiver
                 Y = y;
                 Z = z;
             }
-
             public static Vector3 Zero => new(0, 0, 0);
-
             public float LengthSquared => X * X + Y * Y + Z * Z;
             public float Length => MathF.Sqrt(LengthSquared);
-
             public static Vector3 operator +(Vector3 a, Vector3 b) => new(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
             public static Vector3 operator -(Vector3 a, Vector3 b) => new(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
             public static Vector3 operator *(Vector3 a, float scalar) => new(a.X * scalar, a.Y * scalar, a.Z * scalar);
             public static Vector3 operator /(Vector3 a, float scalar) => new(a.X / scalar, a.Y / scalar, a.Z / scalar);
-
             public override string ToString() => $"({X:F2}, {Y:F2}, {Z:F2})";
         }
 
@@ -3022,13 +3040,13 @@ namespace RustRelayReceiver
             }
 
             [ProtoMember(1)]
-            public float x;
+            public float x { get; set; }
 
             [ProtoMember(2)]
-            public float y;
+            public float y { get; set; }
 
             [ProtoMember(3)]
-            public float z;
+            public float z { get; set; }
 
         }
 
@@ -3044,13 +3062,13 @@ namespace RustRelayReceiver
             public uint size = 4000U;
 
             [ProtoMember(2)]
-            public List<MapData> maps = new List<MapData>();
+            public List<MapData> maps = new();
 
             [ProtoMember(3)]
-            public List<PrefabData> prefabs = new List<PrefabData>();
+            public List<PrefabData> prefabs = new();
 
             [ProtoMember(4)]
-            public List<PathData> paths = new List<PathData>();
+            public List<PathData> paths = new();
         }
 
         public class OldSerialization
@@ -3100,13 +3118,6 @@ namespace RustRelayReceiver
             }
         }
 
-        public double ScaleValue(double value, double fromMin, double fromMax, double toMin, double toMax)
-        {
-            if (fromMax == fromMin) return toMin;
-            double ratio = (value - fromMin) / (fromMax - fromMin);
-            return ratio * (toMax - toMin) + toMin;
-        }
-
         public int GetTopology(int x, int z) { return Topology[z * splatres + x]; }
 
         public static float Byte2Float(int b) => b / 255f;
@@ -3128,11 +3139,13 @@ namespace RustRelayReceiver
             return Math.Min(Byte2Float(sum), 1f);
         }
 
-        public struct Vec4
+        public readonly struct Vec4
         {
-            public float x, y, z, w;
+            public readonly float x, y, z, w;
             public Vec4(float x, float y, float z, float w = 1f) { this.x = x; this.y = y; this.z = z; this.w = w; }
             public static Vec4 operator *(Vec4 v, float f) => new Vec4(v.x * f, v.y * f, v.z * f, v.w * f);
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public static Vec4 Lerp(Vec4 a, Vec4 b, float t) => new Vec4(
                 a.x + (b.x - a.x) * t,
                 a.y + (b.y - a.y) * t,
@@ -3281,6 +3294,713 @@ namespace RustRelayReceiver
             }
 
             return buffer;
+        }
+    }
+
+    public enum KnownColor
+    {
+        ActiveBorder = 1,
+        ActiveCaption,
+        ActiveCaptionText,
+        AppWorkspace,
+        Control,
+        ControlDark,
+        ControlDarkDark,
+        ControlLight,
+        ControlLightLight,
+        ControlText,
+        Desktop,
+        GrayText,
+        Highlight,
+        HighlightText,
+        HotTrack,
+        InactiveBorder,
+        InactiveCaption,
+        InactiveCaptionText,
+        Info,
+        InfoText,
+        Menu,
+        MenuText,
+        ScrollBar,
+        Window,
+        WindowFrame,
+        WindowText,
+        Transparent,
+        AliceBlue,
+        AntiqueWhite,
+        Aqua,
+        Aquamarine,
+        Azure,
+        Beige,
+        Bisque,
+        Black,
+        BlanchedAlmond,
+        Blue,
+        BlueViolet,
+        Brown,
+        BurlyWood,
+        CadetBlue,
+        Chartreuse,
+        Chocolate,
+        Coral,
+        CornflowerBlue,
+        Cornsilk,
+        Crimson,
+        Cyan,
+        DarkBlue,
+        DarkCyan,
+        DarkGoldenrod,
+        DarkGray,
+        DarkGreen,
+        DarkKhaki,
+        DarkMagenta,
+        DarkOliveGreen,
+        DarkOrange,
+        DarkOrchid,
+        DarkRed,
+        DarkSalmon,
+        DarkSeaGreen,
+        DarkSlateBlue,
+        DarkSlateGray,
+        DarkTurquoise,
+        DarkViolet,
+        DeepPink,
+        DeepSkyBlue,
+        DimGray,
+        DodgerBlue,
+        Firebrick,
+        FloralWhite,
+        ForestGreen,
+        Fuchsia,
+        Gainsboro,
+        GhostWhite,
+        Gold,
+        Goldenrod,
+        Gray,
+        Green,
+        GreenYellow,
+        Honeydew,
+        HotPink,
+        IndianRed,
+        Indigo,
+        Ivory,
+        Khaki,
+        Lavender,
+        LavenderBlush,
+        LawnGreen,
+        LemonChiffon,
+        LightBlue,
+        LightCoral,
+        LightCyan,
+        LightGoldenrodYellow,
+        LightGray,
+        LightGreen,
+        LightPink,
+        LightSalmon,
+        LightSeaGreen,
+        LightSkyBlue,
+        LightSlateGray,
+        LightSteelBlue,
+        LightYellow,
+        Lime,
+        LimeGreen,
+        Linen,
+        Magenta,
+        Maroon,
+        MediumAquamarine,
+        MediumBlue,
+        MediumOrchid,
+        MediumPurple,
+        MediumSeaGreen,
+        MediumSlateBlue,
+        MediumSpringGreen,
+        MediumTurquoise,
+        MediumVioletRed,
+        MidnightBlue,
+        MintCream,
+        MistyRose,
+        Moccasin,
+        NavajoWhite,
+        Navy,
+        OldLace,
+        Olive,
+        OliveDrab,
+        Orange,
+        OrangeRed,
+        Orchid,
+        PaleGoldenrod,
+        PaleGreen,
+        PaleTurquoise,
+        PaleVioletRed,
+        PapayaWhip,
+        PeachPuff,
+        Peru,
+        Pink,
+        Plum,
+        PowderBlue,
+        Purple,
+        RebeccaPurple,
+        Red,
+        RosyBrown,
+        RoyalBlue,
+        SaddleBrown,
+        Salmon,
+        SandyBrown,
+        SeaGreen,
+        SeaShell,
+        Sienna,
+        Silver,
+        SkyBlue,
+        SlateBlue,
+        SlateGray,
+        Snow,
+        SpringGreen,
+        SteelBlue,
+        Tan,
+        Teal,
+        Thistle,
+        Tomato,
+        Turquoise,
+        Violet,
+        Wheat,
+        White,
+        WhiteSmoke,
+        Yellow,
+        YellowGreen,
+        ButtonFace,
+        ButtonHighlight,
+        ButtonShadow,
+        GradientActiveCaption,
+        GradientInactiveCaption,
+        MenuBar,
+        MenuHighlight
+    }
+
+    public readonly struct Color : IEquatable<Color>
+    {
+        public static readonly Color Empty;
+
+        public static Color Transparent => new Color(KnownColor.Transparent);
+
+        public static Color AliceBlue => new Color(KnownColor.AliceBlue);
+
+        public static Color AntiqueWhite => new Color(KnownColor.AntiqueWhite);
+
+        public static Color Aqua => new Color(KnownColor.Aqua);
+
+        public static Color Aquamarine => new Color(KnownColor.Aquamarine);
+
+        public static Color Azure => new Color(KnownColor.Azure);
+
+        public static Color Beige => new Color(KnownColor.Beige);
+
+        public static Color Bisque => new Color(KnownColor.Bisque);
+
+        public static Color Black => new Color(KnownColor.Black);
+
+        public static Color BlanchedAlmond => new Color(KnownColor.BlanchedAlmond);
+
+        public static Color Blue => new Color(KnownColor.Blue);
+
+        public static Color BlueViolet => new Color(KnownColor.BlueViolet);
+
+        public static Color Brown => new Color(KnownColor.Brown);
+
+        public static Color BurlyWood => new Color(KnownColor.BurlyWood);
+
+        public static Color CadetBlue => new Color(KnownColor.CadetBlue);
+
+        public static Color Chartreuse => new Color(KnownColor.Chartreuse);
+
+        public static Color Chocolate => new Color(KnownColor.Chocolate);
+
+        public static Color Coral => new Color(KnownColor.Coral);
+
+        public static Color CornflowerBlue => new Color(KnownColor.CornflowerBlue);
+
+        public static Color Cornsilk => new Color(KnownColor.Cornsilk);
+
+        public static Color Crimson => new Color(KnownColor.Crimson);
+
+        public static Color Cyan => new Color(KnownColor.Cyan);
+
+        public static Color DarkBlue => new Color(KnownColor.DarkBlue);
+
+        public static Color DarkCyan => new Color(KnownColor.DarkCyan);
+
+        public static Color DarkGoldenrod => new Color(KnownColor.DarkGoldenrod);
+
+        public static Color DarkGray => new Color(KnownColor.DarkGray);
+
+        public static Color DarkGreen => new Color(KnownColor.DarkGreen);
+
+        public static Color DarkKhaki => new Color(KnownColor.DarkKhaki);
+
+        public static Color DarkMagenta => new Color(KnownColor.DarkMagenta);
+
+        public static Color DarkOliveGreen => new Color(KnownColor.DarkOliveGreen);
+
+        public static Color DarkOrange => new Color(KnownColor.DarkOrange);
+
+        public static Color DarkOrchid => new Color(KnownColor.DarkOrchid);
+
+        public static Color DarkRed => new Color(KnownColor.DarkRed);
+
+        public static Color DarkSalmon => new Color(KnownColor.DarkSalmon);
+
+        public static Color DarkSeaGreen => new Color(KnownColor.DarkSeaGreen);
+
+        public static Color DarkSlateBlue => new Color(KnownColor.DarkSlateBlue);
+
+        public static Color DarkSlateGray => new Color(KnownColor.DarkSlateGray);
+
+        public static Color DarkTurquoise => new Color(KnownColor.DarkTurquoise);
+
+        public static Color DarkViolet => new Color(KnownColor.DarkViolet);
+
+        public static Color DeepPink => new Color(KnownColor.DeepPink);
+
+        public static Color DeepSkyBlue => new Color(KnownColor.DeepSkyBlue);
+
+        public static Color DimGray => new Color(KnownColor.DimGray);
+
+        public static Color DodgerBlue => new Color(KnownColor.DodgerBlue);
+
+        public static Color Firebrick => new Color(KnownColor.Firebrick);
+
+        public static Color FloralWhite => new Color(KnownColor.FloralWhite);
+
+        public static Color ForestGreen => new Color(KnownColor.ForestGreen);
+
+        public static Color Fuchsia => new Color(KnownColor.Fuchsia);
+
+        public static Color Gainsboro => new Color(KnownColor.Gainsboro);
+
+        public static Color GhostWhite => new Color(KnownColor.GhostWhite);
+
+        public static Color Gold => new Color(KnownColor.Gold);
+
+        public static Color Goldenrod => new Color(KnownColor.Goldenrod);
+
+        public static Color Gray => new Color(KnownColor.Gray);
+
+        public static Color Green => new Color(KnownColor.Green);
+
+        public static Color GreenYellow => new Color(KnownColor.GreenYellow);
+
+        public static Color Honeydew => new Color(KnownColor.Honeydew);
+
+        public static Color HotPink => new Color(KnownColor.HotPink);
+
+        public static Color IndianRed => new Color(KnownColor.IndianRed);
+
+        public static Color Indigo => new Color(KnownColor.Indigo);
+
+        public static Color Ivory => new Color(KnownColor.Ivory);
+
+        public static Color Khaki => new Color(KnownColor.Khaki);
+
+        public static Color Lavender => new Color(KnownColor.Lavender);
+
+        public static Color LavenderBlush => new Color(KnownColor.LavenderBlush);
+
+        public static Color LawnGreen => new Color(KnownColor.LawnGreen);
+
+        public static Color LemonChiffon => new Color(KnownColor.LemonChiffon);
+
+        public static Color LightBlue => new Color(KnownColor.LightBlue);
+
+        public static Color LightCoral => new Color(KnownColor.LightCoral);
+
+        public static Color LightCyan => new Color(KnownColor.LightCyan);
+
+        public static Color LightGoldenrodYellow => new Color(KnownColor.LightGoldenrodYellow);
+
+        public static Color LightGreen => new Color(KnownColor.LightGreen);
+
+        public static Color LightGray => new Color(KnownColor.LightGray);
+
+        public static Color LightPink => new Color(KnownColor.LightPink);
+
+        public static Color LightSalmon => new Color(KnownColor.LightSalmon);
+
+        public static Color LightSeaGreen => new Color(KnownColor.LightSeaGreen);
+
+        public static Color LightSkyBlue => new Color(KnownColor.LightSkyBlue);
+
+        public static Color LightSlateGray => new Color(KnownColor.LightSlateGray);
+
+        public static Color LightSteelBlue => new Color(KnownColor.LightSteelBlue);
+
+        public static Color LightYellow => new Color(KnownColor.LightYellow);
+
+        public static Color Lime => new Color(KnownColor.Lime);
+
+        public static Color LimeGreen => new Color(KnownColor.LimeGreen);
+
+        public static Color Linen => new Color(KnownColor.Linen);
+
+        public static Color Magenta => new Color(KnownColor.Magenta);
+
+        public static Color Maroon => new Color(KnownColor.Maroon);
+
+        public static Color MediumAquamarine => new Color(KnownColor.MediumAquamarine);
+
+        public static Color MediumBlue => new Color(KnownColor.MediumBlue);
+
+        public static Color MediumOrchid => new Color(KnownColor.MediumOrchid);
+
+        public static Color MediumPurple => new Color(KnownColor.MediumPurple);
+
+        public static Color MediumSeaGreen => new Color(KnownColor.MediumSeaGreen);
+
+        public static Color MediumSlateBlue => new Color(KnownColor.MediumSlateBlue);
+
+        public static Color MediumSpringGreen => new Color(KnownColor.MediumSpringGreen);
+
+        public static Color MediumTurquoise => new Color(KnownColor.MediumTurquoise);
+
+        public static Color MediumVioletRed => new Color(KnownColor.MediumVioletRed);
+
+        public static Color MidnightBlue => new Color(KnownColor.MidnightBlue);
+
+        public static Color MintCream => new Color(KnownColor.MintCream);
+
+        public static Color MistyRose => new Color(KnownColor.MistyRose);
+
+        public static Color Moccasin => new Color(KnownColor.Moccasin);
+
+        public static Color NavajoWhite => new Color(KnownColor.NavajoWhite);
+
+        public static Color Navy => new Color(KnownColor.Navy);
+
+        public static Color OldLace => new Color(KnownColor.OldLace);
+
+        public static Color Olive => new Color(KnownColor.Olive);
+
+        public static Color OliveDrab => new Color(KnownColor.OliveDrab);
+
+        public static Color Orange => new Color(KnownColor.Orange);
+
+        public static Color OrangeRed => new Color(KnownColor.OrangeRed);
+
+        public static Color Orchid => new Color(KnownColor.Orchid);
+
+        public static Color PaleGoldenrod => new Color(KnownColor.PaleGoldenrod);
+
+        public static Color PaleGreen => new Color(KnownColor.PaleGreen);
+
+        public static Color PaleTurquoise => new Color(KnownColor.PaleTurquoise);
+
+        public static Color PaleVioletRed => new Color(KnownColor.PaleVioletRed);
+
+        public static Color PapayaWhip => new Color(KnownColor.PapayaWhip);
+
+        public static Color PeachPuff => new Color(KnownColor.PeachPuff);
+
+        public static Color Peru => new Color(KnownColor.Peru);
+
+        public static Color Pink => new Color(KnownColor.Pink);
+
+        public static Color Plum => new Color(KnownColor.Plum);
+
+        public static Color PowderBlue => new Color(KnownColor.PowderBlue);
+
+        public static Color Purple => new Color(KnownColor.Purple);
+
+        public static Color RebeccaPurple => new Color(KnownColor.RebeccaPurple);
+
+        public static Color Red => new Color(KnownColor.Red);
+
+        public static Color RosyBrown => new Color(KnownColor.RosyBrown);
+
+        public static Color RoyalBlue => new Color(KnownColor.RoyalBlue);
+
+        public static Color SaddleBrown => new Color(KnownColor.SaddleBrown);
+
+        public static Color Salmon => new Color(KnownColor.Salmon);
+
+        public static Color SandyBrown => new Color(KnownColor.SandyBrown);
+
+        public static Color SeaGreen => new Color(KnownColor.SeaGreen);
+
+        public static Color SeaShell => new Color(KnownColor.SeaShell);
+
+        public static Color Sienna => new Color(KnownColor.Sienna);
+
+        public static Color Silver => new Color(KnownColor.Silver);
+
+        public static Color SkyBlue => new Color(KnownColor.SkyBlue);
+
+        public static Color SlateBlue => new Color(KnownColor.SlateBlue);
+
+        public static Color SlateGray => new Color(KnownColor.SlateGray);
+
+        public static Color Snow => new Color(KnownColor.Snow);
+
+        public static Color SpringGreen => new Color(KnownColor.SpringGreen);
+
+        public static Color SteelBlue => new Color(KnownColor.SteelBlue);
+
+        public static Color Tan => new Color(KnownColor.Tan);
+
+        public static Color Teal => new Color(KnownColor.Teal);
+
+        public static Color Thistle => new Color(KnownColor.Thistle);
+
+        public static Color Tomato => new Color(KnownColor.Tomato);
+
+        public static Color Turquoise => new Color(KnownColor.Turquoise);
+
+        public static Color Violet => new Color(KnownColor.Violet);
+
+        public static Color Wheat => new Color(KnownColor.Wheat);
+
+        public static Color White => new Color(KnownColor.White);
+
+        public static Color WhiteSmoke => new Color(KnownColor.WhiteSmoke);
+
+        public static Color Yellow => new Color(KnownColor.Yellow);
+
+        public static Color YellowGreen => new Color(KnownColor.YellowGreen);
+        private const short StateKnownColorValid = 0x0001;
+        private const short StateARGBValueValid = 0x0002;
+        private const short StateValueMask = StateARGBValueValid;
+        private const short StateNameValid = 0x0008;
+        private const long NotDefinedValue = 0;
+        internal const int ARGBAlphaShift = 24;
+        internal const int ARGBRedShift = 16;
+        internal const int ARGBGreenShift = 8;
+        internal const int ARGBBlueShift = 0;
+        internal const uint ARGBAlphaMask = 0xFFu << ARGBAlphaShift;
+        internal const uint ARGBRedMask = 0xFFu << ARGBRedShift;
+        internal const uint ARGBGreenMask = 0xFFu << ARGBGreenShift;
+        internal const uint ARGBBlueMask = 0xFFu << ARGBBlueShift;
+        private readonly string? name;
+        private readonly long value;
+        private readonly short knownColor;
+        private readonly short state;
+
+        internal Color(KnownColor knownColor)
+        {
+            value = 0;
+            state = StateKnownColorValid;
+            name = null;
+            this.knownColor = unchecked((short)knownColor);
+        }
+
+        private Color(long value, short state, string? name, KnownColor knownColor)
+        {
+            this.value = value;
+            this.state = state;
+            this.name = name;
+            this.knownColor = unchecked((short)knownColor);
+        }
+
+        public byte R => unchecked((byte)(Value >> ARGBRedShift));
+
+        public byte G => unchecked((byte)(Value >> ARGBGreenShift));
+
+        public byte B => unchecked((byte)(Value >> ARGBBlueShift));
+
+        public byte A => unchecked((byte)(Value >> ARGBAlphaShift));
+
+        public bool IsKnownColor => (state & StateKnownColorValid) != 0;
+
+        public bool IsEmpty => state == 0;
+
+        public bool IsNamedColor => ((state & StateNameValid) != 0) || IsKnownColor;
+
+        public bool IsSystemColor => IsKnownColor && IsKnownColorSystem((KnownColor)knownColor);
+
+        internal static bool IsKnownColorSystem(KnownColor knownColor)
+        {
+            var color = Color.FromKnownColor(knownColor);
+            return color.IsSystemColor;
+        }
+
+        public string Name
+        {
+            get
+            {
+                if ((state & StateNameValid) != 0)
+                {
+                    Debug.Assert(name != null);
+                    return name;
+                }
+                if (IsKnownColor)
+                {
+                    string tablename = knownColor.ToString();
+                    Debug.Assert(tablename != null, $"Could not find known color '{(KnownColor)knownColor}' in the KnownColorTable");
+                    return tablename;
+                }
+                return value.ToString("x");
+            }
+        }
+
+        private long Value
+        {
+            get
+            {
+                if ((state & StateValueMask) != 0) { return value; }
+                if (IsKnownColor) { return Color.FromKnownColor((KnownColor)knownColor).ToArgb(); }
+                return NotDefinedValue;
+            }
+        }
+
+        private static void CheckByte(int value)
+        {
+            static void ThrowOutOfByteRange() => throw new ArgumentException();
+            if (unchecked((uint)value) > byte.MaxValue) { ThrowOutOfByteRange(); }
+        }
+
+        private static Color FromArgb(uint argb) => new Color(argb, StateARGBValueValid, null, (KnownColor)0);
+
+        public static Color FromArgb(int argb) => FromArgb(unchecked((uint)argb));
+
+        public static Color FromArgb(int alpha, int red, int green, int blue)
+        {
+            CheckByte(alpha);
+            CheckByte(red);
+            CheckByte(green);
+            CheckByte(blue);
+
+            return FromArgb(
+                (uint)alpha << ARGBAlphaShift |
+                (uint)red << ARGBRedShift |
+                (uint)green << ARGBGreenShift |
+                (uint)blue << ARGBBlueShift
+            );
+        }
+
+        public static Color FromArgb(int alpha, Color baseColor)
+        {
+            CheckByte(alpha);
+
+            return FromArgb(
+                (uint)alpha << ARGBAlphaShift |
+                (uint)baseColor.Value & ~ARGBAlphaMask
+            );
+        }
+
+        public static Color FromArgb(int red, int green, int blue) => FromArgb(byte.MaxValue, red, green, blue);
+
+        public static Color FromKnownColor(KnownColor color) =>
+            color <= 0 || color > KnownColor.RebeccaPurple ? FromName(color.ToString()) : new Color(color);
+
+        public static Color FromName(string name)
+        {
+            return new Color(NotDefinedValue, StateNameValid, name, (KnownColor)0);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal void GetRgbValues(out int r, out int g, out int b)
+        {
+            uint value = (uint)Value;
+            r = (int)(value & ARGBRedMask) >> ARGBRedShift;
+            g = (int)(value & ARGBGreenMask) >> ARGBGreenShift;
+            b = (int)(value & ARGBBlueMask) >> ARGBBlueShift;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void MinMaxRgb(out int min, out int max, int r, int g, int b)
+        {
+            if (r > g)
+            {
+                max = r;
+                min = g;
+            }
+            else
+            {
+                max = g;
+                min = r;
+            }
+            if (b > max)
+            {
+                max = b;
+            }
+            else if (b < min)
+            {
+                min = b;
+            }
+        }
+
+        public float GetBrightness()
+        {
+            GetRgbValues(out int r, out int g, out int b);
+            MinMaxRgb(out int min, out int max, r, g, b);
+            return (max + min) / (byte.MaxValue * 2f);
+        }
+
+        public float GetHue()
+        {
+            GetRgbValues(out int r, out int g, out int b);
+
+            if (r == g && g == b)
+                return 0f;
+
+            MinMaxRgb(out int min, out int max, r, g, b);
+
+            float delta = max - min;
+            float hue;
+
+            if (r == max)
+                hue = (g - b) / delta;
+            else if (g == max)
+                hue = (b - r) / delta + 2f;
+            else
+                hue = (r - g) / delta + 4f;
+
+            hue *= 60f;
+            if (hue < 0f)
+                hue += 360f;
+
+            return hue;
+        }
+
+        public float GetSaturation()
+        {
+            GetRgbValues(out int r, out int g, out int b);
+
+            if (r == g && g == b)
+                return 0f;
+
+            MinMaxRgb(out int min, out int max, r, g, b);
+
+            int div = max + min;
+            if (div > byte.MaxValue)
+                div = byte.MaxValue * 2 - max - min;
+
+            return (max - min) / (float)div;
+        }
+
+        public int ToArgb() => unchecked((int)Value);
+
+        public KnownColor ToKnownColor() => (KnownColor)knownColor;
+
+        public override string ToString() =>
+            IsNamedColor ? $"{nameof(Color)} [{Name}]" :
+            (state & StateValueMask) != 0 ? $"{nameof(Color)} [A={A}, R={R}, G={G}, B={B}]" :
+            $"{nameof(Color)} [Empty]";
+
+        public static bool operator ==(Color left, Color right) =>
+            left.value == right.value
+                && left.state == right.state
+                && left.knownColor == right.knownColor
+                && left.name == right.name;
+
+        public static bool operator !=(Color left, Color right) => !(left == right);
+
+        public override bool Equals([NotNullWhen(true)] object? obj) => obj is Color other && Equals(other);
+
+        public bool Equals(Color other) => this == other;
+
+        public override int GetHashCode()
+        {
+            if (name != null && !IsKnownColor)
+                return name.GetHashCode();
+
+            return HashCode.Combine(value.GetHashCode(), state.GetHashCode(), knownColor.GetHashCode());
         }
     }
     #endregion
@@ -3769,7 +4489,8 @@ transition: all 0.2s ease;
         {
             var key = HtmlCache.ServerDetailKey(wipeId, isAuthenticated);
             var cached = HtmlCache.Get(key);
-            if (cached != null) return cached;
+            if (cached != null) 
+                return cached;
 
             var html = GenerateServerDetailHtml(wipeId, isAuthenticated);
             HtmlCache.Set(key, html);
@@ -3823,6 +4544,8 @@ transition: all 0.2s ease;
 <label><input type=""checkbox"" id=""showBB"" checked> PreventBuilding</label>
 <label><input type=""checkbox"" id=""showWater"" checked> Water</label>
 <label><input type=""checkbox"" id=""showLabels"" checked> Labels</label>
+<label><input type=""checkbox"" id=""showEntities"" checked> Entities</label>
+<label><input type=""checkbox"" id=""showUnlimitedView""> Unlimited View</label>
 </div>
 <div id=""controls"">
 <h3>Navigation Controls</h3>
@@ -3836,6 +4559,7 @@ transition: all 0.2s ease;
 <div id=""info"">
 <p>Position: <span class=""coord"" id=""pos-display"">0, 0, 0</span></p>
 <p>Rotation: <span class=""coord"" id=""rot-display"">0, 0, 0</span></p>
+<p>Entities: <span class=""coord"" id=""entity-count"">0</span></p>
 </div>
 <script src=""https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js""></script>
 <script src=""https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js""></script>
@@ -3848,9 +4572,11 @@ let prefabMarkers = [];
 let prefabLabels = [];
 let collisionMeshes = [];
 let BBMarkers = [];
+const prefabOffsetCache = new Map();
+const prefabOffsetLoading = new Map();
+const effectTimers = new Map();
 let isPointerLocked = false;
 const tempMatrix = new THREE.Matrix4();
-const prefabOffsetCache = new Map();
 const tempPos = new THREE.Vector3();
 const tempDir = new THREE.Vector3();
 const tempQuat = new THREE.Quaternion();
@@ -3868,6 +4594,8 @@ let showPrefabs = true;
 let showWater = true;
 let showBB = true;
 let showLabels = true;
+let showEntities = true;
+let showUnlimitedView = false;
 let waterMesh = null;
 let roadInstancer, railInstancer, riverInstancer;
 const debugEl = document.getElementById('debug-info');
@@ -3962,6 +4690,14 @@ const BBMarkerConfig = {
 'cave_large_hard': { size: [150, 64, 180], type: 'cube', opacity: 0.2 },
 'arctic_research_base_a': { radius: 140, type: 'sphere', opacity: 0.2 }
 };
+const entitiesById = new Map();
+const entityMeshes = new Map();
+const entityLabels = new Map();
+const entityTargets = new Map();
+let lastEntityTimestamp = 0;
+let entityUpdateInterval = null;
+const ENTITY_UPDATE_INTERVAL = 100;
+const ENTITY_LERP_SPEED = 10;
 function isBBMarkerType(prefabName) { return BBMarkerConfig.hasOwnProperty(prefabName); }
 function getBBConfig(label) { return BBMarkerConfig[label] || null; }
 function createBBSphereMarker(x, y, z, radius, label, opacity) {
@@ -4006,10 +4742,10 @@ BBMarkers.push(cube);
 return cube;
 }
 function createBBMarkerFromPrefab(prefab) {
-const pos = prefab.position || prefab.Position || prefab.pos || prefab.Postion;
+const pos = prefab.position || prefab.Position || prefab.pos;
 if (!pos) { return; }
 const rot = prefab.rotation || prefab.Rotation || prefab.rot || { x: 0, y: 0, z: 0 };
-const prefabName = prefab.Name || 'Unknown';
+const prefabName = prefab.name || 'Unknown';
 const config = getBBConfig(prefabName);
 if (!config) { return; }
 const x = pos[0] !== undefined ? pos[0] : (pos.x || 0);
@@ -4053,6 +4789,8 @@ showBB = applyCheckboxState('showBB', true);
 showWater = applyCheckboxState('showWater', true);
 showLabels = applyCheckboxState('showLabels', true);
 showDebug = applyCheckboxState('showDebug', false);
+showEntities = applyCheckboxState('showEntities', true);
+showUnlimitedView = applyCheckboxState('showUnlimitedView', false);
 if (showDebug) { debugEl.classList.remove('hidden');} else { debugEl.classList.add('hidden');}
 function applyInitialVisibility() {
 if (roadInstancer) roadInstancer.visible = showRoads;
@@ -4062,6 +4800,8 @@ if (riverInstancer) riverInstancer.visible = showWater;
 prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
 BBMarkers.forEach(function(m) { m.visible = showBB; });
 prefabLabels.forEach(function(m) { m.visible = showLabels; });
+entityMeshes.forEach(function(mesh) { mesh.visible = showEntities; });
+entityLabels.forEach(function(label) { label.visible = showEntities && showLabels; });
 }
 function log(message, type) {
 type = type || 'success';
@@ -4071,6 +4811,10 @@ const className = type === 'error' ? 'error' : type === 'info' ? 'info' : 'succe
 debugEl.innerHTML += '<div class=""' + className + '"">' + new Date().toLocaleTimeString() + ' - ' + message + '</div>';
 debugEl.scrollTop = debugEl.scrollHeight;
 }
+}
+function updateEntityCountDisplay() {
+const count = entityMeshes.size;
+document.getElementById('entity-count').textContent = count;
 }
 function base64ToInt16Array(base64) {
 try {
@@ -4148,6 +4892,403 @@ roadInstancer = createSegmentInstancer(maxRoadSegs, 8, 0.5, 0x111111);
 railInstancer = createSegmentInstancer(maxRailSegs, 3, 0.5, 0x3d2b1f);
 riverInstancer = createSegmentInstancer(maxRiverSegs, 8, 0.2, 0x87CEEB);
 }
+async function loadEntityOffsets(prefabName) {
+const modelUrl = window.location.origin + '/models/' + prefabName + '.json';
+try {
+const response = await fetch(modelUrl);
+if (!response.ok) throw new Error('Status: ' + response.status);
+const data = await response.json();
+return normalizeOffsets(data);
+} catch (e) {
+return normalizeOffsets(null);
+}
+}
+function normalizeOffsets(data) {
+const d = data || {};
+return {
+positionOffset: {
+x: d.localPositionOffset?.x ?? d.positionOffset?.x ?? 0,
+y: d.localPositionOffset?.y ?? d.positionOffset?.y ?? 0,
+z: d.localPositionOffset?.z ?? d.positionOffset?.z ?? 0
+},
+rotationOffset: {
+x: d.localRotationOffset?.x ?? d.rotationOffset?.x ?? 0,
+y: d.localRotationOffset?.y ?? d.rotationOffset?.y ?? 0,
+z: d.localRotationOffset?.z ?? d.rotationOffset?.z ?? 0
+},
+scaleMultiplier: {
+x: d.localScaleOffset?.x ?? d.scaleMultiplier?.x ?? 1,
+y: d.localScaleOffset?.y ?? d.scaleMultiplier?.y ?? 1,
+z: d.localScaleOffset?.z ?? d.scaleMultiplier?.z ?? 1
+}
+};
+}
+function transformPositionFromUnity(x, y, z) {
+return new THREE.Vector3(x, y, -z);
+}
+function transformRotationFromUnity(rotX, rotY, rotZ) {
+return { x: -rotX, y: -rotY, z: -rotZ };
+}
+function applyEntityTransform(obj, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets) {
+const normalizedPos = transformPositionFromUnity(unityX || 0, unityY || 0, unityZ || 0);
+const rotOffset = offsets?.rotationOffset ?? offsets?.localRotationOffset ?? { x: 0, y: 0, z: 0 };
+const posOffset = offsets?.positionOffset ?? offsets?.localPositionOffset ?? { x: 0, y: 0, z: 0 };
+const scaleOff = offsets?.scaleMultiplier ?? offsets?.localScaleOffset ?? { x: 1, y: 1, z: 1 };
+const baseRotX = unityRotX || 0;
+const baseRotY = unityRotY || 0;
+const baseRotZ = unityRotZ || 0;
+const combinedRotX = baseRotX + (rotOffset.x || 0);
+const combinedRotY = baseRotY + (rotOffset.y || 0);
+const combinedRotZ = baseRotZ + (rotOffset.z || 0);
+const normalizedRot = {
+x: -combinedRotX,
+y: 180 - combinedRotY, 
+z: -combinedRotZ
+};
+const normalizedEuler = new THREE.Euler(
+THREE.MathUtils.degToRad(normalizedRot.x),
+THREE.MathUtils.degToRad(normalizedRot.y),
+THREE.MathUtils.degToRad(normalizedRot.z),
+'YXZ'
+);
+const normalizedQuat = new THREE.Quaternion().setFromEuler(normalizedEuler);   
+let localOffset = new THREE.Vector3(0, 0, 0);
+if (posOffset) {
+localOffset.set(posOffset.x || 0, posOffset.y || 0, posOffset.z || 0);
+localOffset.applyQuaternion(normalizedQuat);
+} 
+const finalPosition = normalizedPos.clone().add(localOffset);
+obj.position.copy(finalPosition);
+obj.quaternion.copy(normalizedQuat);
+const glbScale = new THREE.Vector3();
+const glbQuat = new THREE.Quaternion();
+const glbPos = new THREE.Vector3();
+obj.matrixWorld.decompose(glbPos, glbQuat, glbScale);
+const scaleX = glbScale.x * (scaleOff.x || 1);
+const scaleY = glbScale.y * (scaleOff.y || 1);
+const scaleZ = glbScale.z * (scaleOff.z || 1);
+obj.scale.set(scaleX, scaleY, scaleZ);
+}
+function addEntityLabel(prefabName, x, y, z) {
+const canvas = document.createElement('canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 512;
+canvas.height = 128;
+ctx.fillStyle = 'rgba(0, 50, 100, 0.8)';
+ctx.fillRect(0, 0, 512, 128);
+ctx.fillStyle = '#00ffff';
+ctx.font = 'bold 28px Arial';
+ctx.textAlign = 'center';
+ctx.fillText(prefabName, 256, 64);
+const texture = new THREE.CanvasTexture(canvas);
+const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: true });
+const sprite = new THREE.Sprite(spriteMat);
+sprite.position.set(x, y + 5, z);
+sprite.scale.set(60, 15, 1);
+sprite.visible = showLabels && showEntities;
+scene.add(sprite);
+return sprite;
+}
+async function spawnEntity(entityData) {
+const entityId = entityData.id ?? entityData.id;
+const prefabName = (entityData.PrefabName || entityData.Prefab || entityData.prefabName || 'Unknown').replace(/\.prefab$/i, '');
+const isDestroyed = entityData.isdestroyed === true || entityData.isdestroyed === 1 || entityData.isdestroyed === ""true"";
+if (isDestroyed) {
+if (entityMeshes.has(entityId)) {
+despawnEntity(entityId);
+}
+return;
+}
+if (entityMeshes.has(entityId)) {
+updateEntityPosition(entityData);
+return;
+}
+const pos = entityData.pos || entityData.Position || entityData.position || { x: 0, y: 0, z: 0 };
+const rot = entityData.rot || entityData.Rotation || entityData.rotation || { x: 0, y: 0, z: 0 };
+const unityX = pos.X !== undefined ? pos.X : (pos.x !== undefined ? pos.x : (pos[0] || 0));
+const unityY = pos.Y !== undefined ? pos.Y : (pos.y !== undefined ? pos.y : (pos[1] || 0));
+const unityZ = pos.Z !== undefined ? pos.Z : (pos.z !== undefined ? pos.z : (pos[2] || 0));
+const unityRotX = rot.X !== undefined ? rot.X : (rot.x !== undefined ? rot.x : (rot[0] || 0));
+const unityRotY = rot.Y !== undefined ? rot.Y : (rot.y !== undefined ? rot.y : (rot[1] || 0));
+const unityRotZ = rot.Z !== undefined ? rot.Z : (rot.z !== undefined ? rot.z : (rot[2] || 0));
+const modelUrl = window.location.origin + '/models/' + prefabName + '.glb';
+let offsets;
+try { 
+offsets = await loadPrefabOffset(prefabName); 
+} catch (err) { 
+console.error('Failed to load offsets for ' + prefabName + ', using defaults.', err); 
+offsets = { positionOffset: { x: 0, y: 0, z: 0 }, rotationOffset: { x: 0, y: 0, z: 0 }, scaleMultiplier: { x: 1, y: 1, z: 1 } }; 
+}  
+if (loadedGLBModels[modelUrl]) {
+const cached = loadedGLBModels[modelUrl];
+const model = cached.scene.clone();
+applyEntityTransform(model, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets);
+model.visible = showEntities;
+scene.add(model);
+entityMeshes.set(entityId, model);
+const label = addEntityLabel(prefabName, model.position.x, model.position.y, model.position.z);
+entityLabels.set(entityId, label);
+entitiesById.set(entityId, entityData);
+updateEntityCountDisplay();
+return;
+}
+await new Promise((resolve, reject) => {
+loadGLBModel(modelUrl, function(gltf) {
+const model = gltf.scene;
+loadedGLBModels[modelUrl] = gltf;
+applyEntityTransform(model, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets);
+model.visible = showEntities;
+scene.add(model);
+entityMeshes.set(entityId, model);
+const label = addEntityLabel(prefabName, model.position.x, model.position.y, model.position.z);
+entityLabels.set(entityId, label);
+entitiesById.set(entityId, entityData);
+updateEntityCountDisplay();
+resolve();
+}, function(error) {
+const markerGeo = new THREE.BoxGeometry(3, 3, 3);
+const markerMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, opacity: 0.9, transparent: true });
+const marker = new THREE.Mesh(markerGeo, markerMat);
+marker.visible = showEntities;
+scene.add(marker);
+entityMeshes.set(entityId, marker);
+const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
+const label = addEntityLabel(prefabName, markerPos.x, markerPos.y, markerPos.z);
+entityLabels.set(entityId, label);
+entitiesById.set(entityId, entityData);
+updateEntityCountDisplay();
+marker.position.copy(markerPos);
+resolve();
+});
+});
+}
+function updateEntityPosition(entityData) {
+const entityId = entityData.Id || entityData.id;
+const mesh = entityMeshes.get(entityId);
+const label = entityLabels.get(entityId);
+if (!mesh) return;
+const isDestroyed = entityData.isdestroyed === true || entityData.isdestroyed === 1 || entityData.isdestroyed === ""true"";
+if (isDestroyed) {
+despawnEntity(entityId);
+return;
+}
+const prefabName = (entityData.PrefabName || entityData.Prefab || entityData.prefabName || 'Unknown').replace(/(\.corpse)?(\.prefab)$/i, '');
+const offsets = prefabOffsetCache.get(prefabName) || {positionOffset: { x: 0, y: 0, z: 0 },rotationOffset: { x: 0, y: 0, z: 0 },scaleMultiplier: { x: 1, y: 1, z: 1 }};
+const pos = entityData.pos || entityData.Position || entityData.position || { x: 0, y: 0, z: 0 };
+const rot = entityData.rot || entityData.Rotation || entityData.rotation || { x: 0, y: 0, z: 0 };
+const unityX = pos.X !== undefined ? pos.X : (pos.x !== undefined ? pos.x : (pos[0] || 0));
+const unityY = pos.Y !== undefined ? pos.Y : (pos.y !== undefined ? pos.y : (pos[1] || 0));
+const unityZ = pos.Z !== undefined ? pos.Z : (pos.z !== undefined ? pos.z : (pos[2] || 0));
+const unityRotX = rot.X !== undefined ? rot.X : (rot.x !== undefined ? rot.x : (rot[0] || 0));
+const unityRotY = rot.Y !== undefined ? rot.Y : (rot.y !== undefined ? rot.y : (rot[1] || 0));
+const unityRotZ = rot.Z !== undefined ? rot.Z : (rot.z !== undefined ? rot.z : (rot[2] || 0));
+const posOffset = offsets?.positionOffset ?? offsets?.localPositionOffset ?? { x: 0, y: 0, z: 0 };
+const adjustedX = unityX + (posOffset.x || 0);
+const adjustedY = unityY + (posOffset.y || 0);
+const adjustedZ = unityZ + (posOffset.z || 0);
+const targetPos = transformPositionFromUnity(adjustedX, adjustedY, adjustedZ);
+const targetRot = new THREE.Euler(
+THREE.MathUtils.degToRad(unityRotX),
+THREE.MathUtils.degToRad(unityRotY),
+THREE.MathUtils.degToRad(unityRotZ),
+'YXZ'
+);
+const targetQuat = new THREE.Quaternion().setFromEuler(targetRot);
+entityTargets.set(entityId, {
+position: targetPos,
+quaternion: targetQuat,
+labelOffset: 5
+});
+entitiesById.set(entityId, entityData);
+}
+function despawnEntity(entityId) {
+const mesh = entityMeshes.get(entityId);
+const label = entityLabels.get(entityId);
+if (mesh) {
+scene.remove(mesh);
+if (mesh.geometry) mesh.geometry.dispose();
+if (mesh.material) {
+if (Array.isArray(mesh.material)) {
+mesh.material.forEach(m => m.dispose());
+} else {
+mesh.material.dispose();
+}
+}
+entityMeshes.delete(entityId);
+}
+log('Despawn entity: (ID: ' + entityId + ')', 'success');
+if (label) {
+scene.remove(label);
+if (label.material.map) label.material.map.dispose();
+label.material.dispose();
+entityLabels.delete(entityId);
+}
+entityTargets.delete(entityId);
+entitiesById.delete(entityId);
+updateEntityCountDisplay();
+log('Despawned entity ID: ' + entityId, 'info');
+}
+async function loadAllEntities() {
+try {
+const response = await fetch('/3dmap/entities/" + WipeID + @"');
+if (!response.ok) throw new Error('HTTP ' + response.status);
+const data = await response.json();
+if (data.entities && Array.isArray(data.entities)) {
+lastEntityTimestamp = data.timestamp || 0;
+log('Loading ' + data.entities.length + ' entities...', 'info');
+for (const entity of data.entities) {
+await spawnEntity(entity);
+}
+log('Loaded ' + entityMeshes.size + ' entities', 'success');
+}
+if (data.effects && Array.isArray(data.effects)) {
+log('Processing ' + data.effects.length + ' effects...', 'info');
+for (const effect of data.effects) {
+await spawnEntity(effect);
+}
+}
+} catch (error) {
+log('Failed to load entities: ' + error.message, 'error');
+}
+}
+function spawnEffectWithTTL(effect, ttlMs = 5000) {
+const effectId = effect.id ?? effect.Id;
+if (!effectId) {return;}
+spawnEntity(effect);
+if (effectTimers.has(effectId)) {clearTimeout(effectTimers.get(effectId));}
+const timer = setTimeout(() => {despawnEntity(effectId);effectTimers.delete(effectId);}, ttlMs);
+effectTimers.set(effectId, timer);
+}
+async function pollEntityUpdates() {
+try {
+const url = `/3dmap/update/${WipeID}?cx=${cx}&cy=${cy}&cz=${cz}&unlimited=${showUnlimitedView}`;
+const response = await fetch(url);
+if (!response.ok) throw new Error('HTTP ' + response.status);
+const data = await response.json();
+if (data.entities && Array.isArray(data.entities)) {
+if (data.entities.length > 0) {
+lastEntityTimestamp = data.timestamp || Date.now();
+const updatedIds = new Set();
+for (const entity of data.entities) {
+const entityId = entity.id ?? entity.Id;
+updatedIds.add(entityId);
+await spawnEntity(entity);
+}
+const removedIds = entityData._removedIds || [];
+for (const removedId of removedIds) {
+despawnEntity(removedId);
+}
+}
+}
+if (data.effects && Array.isArray(data.effects)) {
+for (const effect of data.effects) {
+await spawnEntity(effect);
+}
+}
+} catch (error) {
+log('Entity update error: ' + error.message, 'error');
+}
+}
+function startEntityUpdates() {
+if (entityUpdateInterval) return;
+loadAllEntities().then(() => {
+entityUpdateInterval = setInterval(pollEntityUpdates, ENTITY_UPDATE_INTERVAL);
+});
+}
+function stopEntityUpdates() {
+if (entityUpdateInterval) {
+clearInterval(entityUpdateInterval);
+entityUpdateInterval = null;
+}
+}
+const removedEntityIds = new Set();
+function removeEntityById(entityId) {
+removedEntityIds.add(entityId);
+}
+async function loadAllEntities() {
+try {
+const response = await fetch('/3dmap/entities/" + WipeID + @"');
+if (!response.ok) throw new Error('HTTP ' + response.status);
+const data = await response.json();
+if (data.entities && Array.isArray(data.entities)) {
+lastEntityTimestamp = data.timestamp || 0;
+log('Loading ' + data.entities.length + ' entities...', 'info');
+for (const entity of data.entities) {
+const isDestroyed = entity.isdestroyed === true || entity.isdestroyed === 1 || entity.isdestroyed === ""true"";
+if (isDestroyed) {
+removeEntityById(entity.id || entity.id);
+} else {
+await spawnEntity(entity);
+}
+}
+log('Loaded ' + entityMeshes.size + ' entities', 'success');
+}
+if (data.effects && Array.isArray(data.effects)) {
+log('Processing ' + data.effects.length + ' effects...', 'info');
+for (const effect of data.effects) {
+if (effect.isdestroyed) {
+removeEntityById(effect.Id || effect.id);
+} else {
+await spawnEntity(effect);
+}
+}
+}
+} catch (error) {
+log('Failed to load entities: ' + error.message, 'error');
+}
+}
+async function pollEntityUpdates() {
+try {
+const cx = camera.position.x;
+const cy = camera.position.y;
+const cz = -camera.position.z;
+const url = '/3dmap/update/" + WipeID + @"?cx=' + cx + '&cy=' + cy + '&cz=' + cz + '&unlimited=' + showUnlimitedView;
+const response = await fetch(url);
+if (!response.ok) throw new Error('HTTP ' + response.status);
+const data = await response.json();
+if (data.entities && Array.isArray(data.entities)) {
+if (data.entities.length > 0) {
+lastEntityTimestamp = data.timestamp || Date.now();
+for (const entity of data.entities) {
+const entityId = entity.id ?? entity.Id;
+const isDestroyed = entity.isdestroyed === true || entity.isdestroyed === 1 || entity.isdestroyed === ""true"";
+if (isDestroyed) {despawnEntity(entityId);continue;}
+spawnEntity(entity);
+}
+}
+if (data.removedIds && Array.isArray(data.removedIds)) {
+for (const removedId of data.removedIds) {
+if (entityMeshes.has(removedId)) {
+despawnEntity(removedId);
+}
+}
+}
+}
+if (data.effects && Array.isArray(data.effects)) {
+for (const effect of data.effects) {
+const effectId = effect.id ?? effect.Id;
+if (effect.isdestroyed) {
+if (entityMeshes.has(effectId)) {
+despawnEntity(effectId);}
+} else {spawnEffectWithTTL(effect, 5000);}
+}
+}
+} catch (error) {
+log('Entity update error: ' + error.message, 'error');
+}
+}
+function startEntityUpdates() {
+if (entityUpdateInterval) return;
+loadAllEntities().then(() => {
+entityUpdateInterval = setInterval(pollEntityUpdates, ENTITY_UPDATE_INTERVAL);
+});
+}
+function stopEntityUpdates() {
+if (entityUpdateInterval) {
+clearInterval(entityUpdateInterval);
+entityUpdateInterval = null;
+}
+}
 async function init() {
 scene = new THREE.Scene();
 scene.background = new THREE.Color(0x87CEEB);
@@ -4176,8 +5317,16 @@ if (isMobile) {
 const debugLabel = document.querySelector('#layer-toggle label input#showDebug')?.parentElement;
 if (debugLabel) debugLabel.style.display = 'none';
 }
-setTimeout(function() { document.getElementById('loading').classList.add('hidden'); }, 1000);
+startEntityUpdates();
+checkLoadingComplete();
 animate();
+}
+function checkLoadingComplete() {
+if (window.terrainLoaded) {
+document.getElementById('loading').classList.add('hidden');
+} else {
+setTimeout(checkLoadingComplete, 60);
+}
 }
 async function loadTerrain() {
 try {
@@ -4213,7 +5362,7 @@ let splatData = await decompressData(terrainData.splatmap);
 window.terrainHeights = heights;
 window.terrainResolution = dstRes;
 window.splatData = splatData;
-window.splatResolution = terrainData.splatMapResolution || terrainData.heightMapResolution;
+window.splatResolution = terrainData.splatMapResolution;
 window.terrainLoaded = true;
 createTerrainMesh(heights, terrainData.splatColors);
 createWaterMesh();
@@ -4224,6 +5373,7 @@ if (terrainData.river && terrainData.river.length > 0) { drawRiverFromServer(ter
 } catch (error) {
 log('Failed to load terrain: ' + error.message, 'error');
 createDemoTerrain();
+window.terrainLoaded = true;
 }
 }
 function createTerrainMesh(heights, splatColors) {
@@ -4297,7 +5447,7 @@ collisionMeshes.push(terrain);
 log('Terrain mesh created', 'success');
 }
 function createWaterMesh() {
-const waterHeight = 0.01;
+const waterHeight = 1.2;
 const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 1, 1);
 const waterMat = new THREE.MeshPhongMaterial({ color: 0x1a5f7a, transparent: true, opacity: 0.75, shininess: 100, depthWrite: true });
 waterMesh = new THREE.Mesh(waterGeo, waterMat);
@@ -4413,26 +5563,36 @@ if (!gltfLoader) { if (onError) onError('GLTFLoader not initialized'); return; }
 gltfLoader.load(url, function(gltf) { if (onLoad) onLoad(gltf); }, function(progress) { }, function(error) { if (onError) onError(error); });
 }
 async function loadPrefabOffset(prefabName) {
-if (prefabOffsetCache.has(prefabName)) { return await prefabOffsetCache.get(prefabName); }
-const fetchPromise = (async function() {
-const offsetUrl = window.location.origin + '/models/' + prefabName + '.json';
+if (prefabOffsetCache.has(prefabName)) {return prefabOffsetCache.get(prefabName);}
+if (prefabOffsetLoading.has(prefabName)) {return await prefabOffsetLoading.get(prefabName);}
+const promise = (async () => {
 try {
-const response = await fetch(offsetUrl);
-if (!response.ok) throw new Error('Status: ' + response.status);
-const data = await response.json();
-return normalizeOffsets(data);
-} catch (e) { console.warn('Load failed for ' + prefabName + ', using defaults.', e.message); return normalizeOffsets(null); }
-})();
-prefabOffsetCache.set(prefabName, fetchPromise);
-return await fetchPromise;
-}
-function normalizeOffsets(data) {
-const d = data || {};
-return {
-positionOffset: { x: d.positionOffset && d.positionOffset.x !== undefined ? d.positionOffset.x : (d.localPositionOffset && d.localPositionOffset.x !== undefined ? d.localPositionOffset.x : 0), y: d.positionOffset && d.positionOffset.y !== undefined ? d.positionOffset.y : (d.localPositionOffset && d.localPositionOffset.y !== undefined ? d.localPositionOffset.y : 0), z: d.positionOffset && d.positionOffset.z !== undefined ? d.positionOffset.z : (d.localPositionOffset && d.localPositionOffset.z !== undefined ? d.localPositionOffset.z : 0) },
-rotationOffset: { x: d.rotationOffset && d.rotationOffset.x !== undefined ? d.rotationOffset.x : (d.localRotationOffset && d.localRotationOffset.x !== undefined ? d.localRotationOffset.x : 0), y: d.rotationOffset && d.rotationOffset.y !== undefined ? d.rotationOffset.y : (d.localRotationOffset && d.localRotationOffset.y !== undefined ? d.localRotationOffset.y : 0), z: d.rotationOffset && d.rotationOffset.z !== undefined ? d.rotationOffset.z : (d.localRotationOffset && d.localRotationOffset.z !== undefined ? d.localRotationOffset.z : 0) },
-scaleMultiplier: { x: d.scaleMultiplier && d.scaleMultiplier.x !== undefined ? d.scaleMultiplier.x : (d.localScaleOffset && d.localScaleOffset.x !== undefined ? d.localScaleOffset.x : 1), y: d.scaleMultiplier && d.scaleMultiplier.y !== undefined ? d.scaleMultiplier.y : (d.localScaleOffset && d.localScaleOffset.y !== undefined ? d.localScaleOffset.y : 1), z: d.scaleMultiplier && d.scaleMultiplier.z !== undefined ? d.scaleMultiplier.z : (d.localScaleOffset && d.localScaleOffset.z !== undefined ? d.localScaleOffset.z : 1) }
+const offsets = await loadEntityOffsets(prefabName);
+prefabOffsetCache.set(prefabName, offsets);
+return offsets;
+} catch (err) {
+const fallback = {
+positionOffset: { x: 0, y: 0, z: 0 },
+rotationOffset: { x: 0, y: 0, z: 0 },
+scaleMultiplier: { x: 1, y: 1, z: 1 }
 };
+prefabOffsetCache.set(prefabName, fallback);
+return fallback;
+} finally {
+prefabOffsetLoading.delete(prefabName);
+}
+})();
+prefabOffsetLoading.set(prefabName, promise);
+return await promise;
+}
+function clearPrefabOffsetCache(prefabName) {
+if (prefabName) {
+prefabOffsetCache.delete(prefabName);
+console.log('Cleared cache for: ' + prefabName);
+} else {
+prefabOffsetCache.clear();
+console.log('Cleared all offset caches');
+}
 }
 function transformPositionFromUnity(x, y, z) { return new THREE.Vector3(x, y, -z); }
 function transformRotationFromUnity(rotX, rotY, rotZ) { return { x: -rotX, y: -rotY, z: -rotZ }; }
@@ -4467,7 +5627,7 @@ if (scaleOff) { scaleX *= (scaleOff.x || 1); scaleY *= (scaleOff.y || 1); scaleZ
 obj.scale.set(glbScale.x * scaleX, glbScale.y * scaleY, glbScale.z * scaleZ);
 }
 async function processPrefab(prefab, index) {
-const pos = prefab.position || prefab.Position || prefab.pos || prefab.Postion;
+const pos = prefab.position || prefab.Position || prefab.pos;
 if (!pos) { return; }
 const unityX = pos[0] !== undefined ? pos[0] : (pos.x || 0);
 const unityY = pos[1] !== undefined ? pos[1] : (pos.y || 0);
@@ -4476,7 +5636,7 @@ const rot = prefab.rotation || prefab.Rotation || prefab.rot || { x: 0, y: 0, z:
 const unityRot = { x: rot[0] !== undefined ? rot[0] : (rot.x || 0), y: rot[1] !== undefined ? rot[1] : (rot.y || 0), z: rot[2] !== undefined ? rot[2] : (rot.z || 0) };
 const scaleData = prefab.scale || prefab.Scale || { x: 1, y: 1, z: 1 };
 const baseScale = { x: scaleData[0] !== undefined ? scaleData[0] : (scaleData.x || 1), y: scaleData[1] !== undefined ? scaleData[1] : (scaleData.y || 1), z: scaleData[2] !== undefined ? scaleData[2] : (scaleData.z || 1) };
-const prefabName = prefab.Name || 'Unknown';
+const prefabName = prefab.name || 'Unknown';
 if (isBBMarkerType(prefabName)) { createBBMarkerFromPrefab(prefab); }
 const shouldSkipModel = prefabName.includes('cave_') || prefabName.includes('swamp_') || prefabName.includes('ice_lake') || prefabName.includes('water_well') || prefabName.includes('ue_jungle_swamp') || prefabName.includes('ue_lake') || prefabName.includes('ue_oasis') || prefabName.includes('ue_canyon');
 if (shouldSkipModel) {
@@ -4517,7 +5677,7 @@ const maxPrefabs = Math.min(prefabsData.length, 500);
 let bbCount = 0;
 for (let i = 0; i < maxPrefabs; i++) {
 const prefab = prefabsData[i];
-const prefabName = prefab.Name || 'Unknown';
+const prefabName = prefab.name || 'Unknown';
 if (isBBMarkerType(prefabName)) { bbCount++; }
 processPrefab(prefabsData[i], i);
 }
@@ -4635,6 +5795,21 @@ const state = loadLayerState();
 state['showLabels'] = showLabels;
 saveLayerState(state);
 prefabLabels.forEach(function(m) { m.visible = showLabels; });
+entityLabels.forEach(function(m) { m.visible = showLabels && showEntities; });
+});
+document.getElementById('showEntities').addEventListener('change', function(e) {
+showEntities = e.target.checked;
+const state = loadLayerState();
+state['showEntities'] = showEntities;
+saveLayerState(state);
+entityMeshes.forEach(function(m) { m.visible = showEntities; });
+entityLabels.forEach(function(m) { m.visible = showLabels && showEntities; });
+});
+document.getElementById('showUnlimitedView').addEventListener('change', function(e) {
+showUnlimitedView = e.target.checked;
+const state = loadLayerState();
+state['showUnlimitedView'] = showUnlimitedView;
+saveLayerState(state);
 });
 }
 function setupControls() {
@@ -4941,7 +6116,25 @@ const delta = (performance.now() - lastTime) / 1000;
 lastTime = performance.now();
 updateMovement(delta);
 updateRotationDisplay();
+updateEntityLerp(delta);
 renderer.render(scene, camera);
+}
+
+function updateEntityLerp(delta) {
+const lerpFactor = Math.min(1, ENTITY_LERP_SPEED * delta);
+entityTargets.forEach(function(target, entityId) {
+const mesh = entityMeshes.get(entityId);
+const label = entityLabels.get(entityId);
+if (!mesh) return;
+mesh.position.lerp(target.position, lerpFactor);
+const currentQuat = new THREE.Quaternion();
+mesh.getWorldQuaternion(currentQuat);
+const slerpQuat = currentQuat.slerp(target.quaternion, lerpFactor);
+mesh.quaternion.copy(slerpQuat);
+if (label) {
+label.position.set(mesh.position.x, mesh.position.y + target.labelOffset, mesh.position.z);
+}
+});
 }
 init();
 </script>
@@ -5121,7 +6314,7 @@ async function displayServerDetail(data) {
     document.getElementById('content').style.display = 'block';
     const s = data.server;
     const totalBytes = s.bytesReceived || 0;
-    const mapInfo = data.mapInfo || {};
+    const mapInfo = data.mapInfo;
     const worldSize = mapInfo.worldSize || mapInfo.worldsize || mapInfo.size || 'Unknown';
     let pngBytes = null;
     if (mapInfo.png) {pngBytes = await decompressData(mapInfo.png);}
