@@ -23,14 +23,33 @@
     <None Remove="Properties\**" />
   </ItemGroup>
   <ItemGroup>
+    <None Remove="Libs\favicon.ico" />
+    <None Remove="Libs\LZ4.dll" />
+    <None Remove="Libs\LZ4pn.dll" />
+    <None Remove="Libs\Rust.Polyfills.dll" />
+  </ItemGroup>
+  <ItemGroup>
     <Reference Include="LZ4">
-      <HintPath>\Libs\LZ4.dll</HintPath>
+      <HintPath>Libs\LZ4.dll</HintPath>
+      <Private>False</Private>
     </Reference>
     <Reference Include="LZ4pn">
-      <HintPath>\Libs\LZ4pn.dll</HintPath>
+      <HintPath>Libs\LZ4pn.dll</HintPath>
+      <Private>False</Private>
     </Reference>
-    <Reference Include="protobuf-net">
-      <HintPath>\Libs\protobuf-net.dll</HintPath>
+    <Reference Include="Rust.Polyfills">
+      <HintPath>Libs\Rust.Polyfills.dll</HintPath>
+      <Private>False</Private>
     </Reference>
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Libs\favicon.ico" />
+    <EmbeddedResource Include="Libs\LZ4.dll">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Libs\LZ4pn.dll">
+      <CopyToOutputDirectory>Never</CopyToOutputDirectory>
+    </EmbeddedResource>
+    <EmbeddedResource Include="Libs\Rust.Polyfills.dll" />
   </ItemGroup>
 </Project>

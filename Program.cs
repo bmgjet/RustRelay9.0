@@ -9,7 +9,6 @@
  ░             ░         ░  ░   ░      ░  ░*/
 using LZ4;
 using ProtoBuf;
-using RustRelayReceiver.ProtoBuf;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -19,17 +18,40 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.Json;
-using static RustRelayReceiver.ProtoPacketProcessor;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Diagnostics.CodeAnalysis;
-
+using System.Net.WebSockets;
+using System.Reflection;
+using UnityEngine;
+static class EmbededDlls
+{
+    public static Assembly? Resolve(object? sender, ResolveEventArgs args)
+    {
+        var requestedName = new AssemblyName(args.Name).Name + ".dll";
+        Console.WriteLine($"Resolving managed: {requestedName}");
+        var resourceName = requestedName switch
+        {
+            "LZ4.dll" => "RustRelay9._0.Libs.LZ4.dll",
+            "LZ4pn.dll" => "RustRelay9._0.Libs.LZ4pn.dll",
+            "Rust.Polyfills.dll" => "RustRelay9._0.Libs.Rust.Polyfills.dll",
+            _ => null
+        };
+        if (resourceName == null) { return null; }
+        var asm = Assembly.GetExecutingAssembly();
+        using var stream = asm.GetManifestResourceStream(resourceName);
+        if (stream == null) { return null; }
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return Assembly.Load(ms.ToArray());
+    }
+}
 namespace RustRelayReceiver
 {
     class Program
     {
         // Configuration
-        public static string Version = "RustRelay9.0 V002";
+        public static string Version = "RustRelay9.0 V003";
         private static string _baseUrl = "http://localhost:8080";
         private static string _authToken = "demotoken";
         private static readonly HttpListener _httpListener = new();
@@ -56,10 +78,60 @@ namespace RustRelayReceiver
         public static readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, TrackedEntity>> _entitiesByWipe = new();
         public static readonly ConcurrentDictionary<string, ConcurrentDictionary<ulong, TrackedEffect>> _effectsByWipe = new();
         public static readonly ConcurrentDictionary<string, bool> _wipeIds = new();
-
+        public struct VectorData
+        {
+            [NonSerialized] public float x;
+            [NonSerialized] public float y;
+            [NonSerialized] public float z;
+            public VectorData(float x, float y, float z)
+            {
+                this.x = x;
+                this.y = y;
+                this.z = z;
+            }
+            [JsonPropertyName("x")]
+            public float X => x;
+            [JsonPropertyName("y")]
+            public float Y => y;
+            [JsonPropertyName("z")]
+            public float Z => z;
+        }
+        private enum MessageType : byte
+        {
+            Welcome = 1,
+            Auth = 2,
+            Approved = 3,
+            Ready = 4,
+            Entities = 5,
+            EntityDestroy = 6,
+            GroupChange = 7,
+            GroupDestroy = 8,
+            RPCMessage = 9,
+            EntityPosition = 10,
+            ConsoleMessage = 11,
+            ConsoleCommand = 12,
+            Effect = 13,
+            DisconnectReason = 14,
+            Tick = 15,
+            Message = 16,
+            RequestUserInformation = 17,
+            GiveUserInformation = 18,
+            GroupEnter = 19,
+            GroupLeave = 20,
+            VoiceData = 21,
+            EAC = 22,
+            EntityFlags = 23,
+            World = 24,
+            ConsoleReplicatedVars = 25,
+            QueueUpdate = 26,
+            SyncVar = 27,
+            PackedSyncVar = 28,
+            Last = 28,
+        }
         #region Server
         static void Main(string[] args)
         {
+            AppDomain.CurrentDomain.AssemblyResolve += EmbededDlls.Resolve;
             PrintStatistics();
             ParseArguments(args);
             Console.WriteLine($"Starting {Version} relay server on {_baseUrl}");
@@ -72,7 +144,6 @@ namespace RustRelayReceiver
                     PrintStatistics();
                 }
             });
-
             var mre = new ManualResetEvent(false);
             Console.CancelKeyPress += (s, e) =>
             {
@@ -83,17 +154,15 @@ namespace RustRelayReceiver
             Console.WriteLine("\nShutting down...");
             StopAll();
         }
-
         private static void StartHttpListener()
         {
             _httpListener.Prefixes.Clear();
             _httpListener.Prefixes.Add(_baseUrl.TrimEnd('/') + "/");
-
             try { _httpListener.Start(); }
             catch (Exception ex)
             {
                 LogDebug($"Failed to start: {ex.Message}");
-                Environment.Exit(1);
+                System.Environment.Exit(1);
             }
             Task.Run(async () =>
             {
@@ -109,14 +178,12 @@ namespace RustRelayReceiver
                 }
             });
         }
-
         private class WebSocketClient
         {
             public System.Net.WebSockets.WebSocket? Socket { get; set; }
             public string? WipeId { get; set; }
             public DateTime ConnectedAt { get; set; }
         }
-
         public static void SafeWrite(HttpListenerResponse resp, byte[] data, string contentType = "application/octet-stream")
         {
             try
@@ -137,35 +204,30 @@ namespace RustRelayReceiver
                 try { resp.Close(); } catch { }
             }
         }
-
         private static void OnStringPoolReceived(string? wipeId, Dictionary<uint, string> stringPool)
         {
             _ = SaveStringPoolToFile(wipeId, stringPool);
         }
-
         private static void OnManifestReceived(string? wipeId, Dictionary<uint, string> manifest)
         {
             SaveManifestToFile(wipeId, manifest);
         }
-
         private static void OnSnapshotReceived(string? wipeId, byte[] data)
         {
             SaveSnapshotToFile(wipeId, data);
         }
-
         private static void OnMapFileReceived(string? wipeId, string filename, byte[] data)
         {
             if (wipeId == null) { return; }
             SaveMapFileToDirectory(wipeId, filename, data);
             LogDebug($"[MapFile] {filename}");
         }
-
         public static event Action<TrackedEntity, string>? OnEntityCreated;
         public static event Action<TrackedEntity, string>? OnEntityUpdated;
         public static event Action<string, ulong>? OnEntityDestroyed;
         public static event Action<EffectData, string>? OnEffectDecoded;
+        public static event Action<string, ulong, ulong>? OnRPCReceived;
         #endregion
-
         #region Processing
         private static async void ProcessRequestAsync(HttpListenerContext context)
         {
@@ -179,7 +241,6 @@ namespace RustRelayReceiver
             catch (Exception ex) { LogDebug($"Processing error: {ex.Message}"); }
             finally { }
         }
-
         private static async Task<Dictionary<string, byte[]>> ParseMultipartFormData(HttpListenerRequest request)
         {
             var files = new Dictionary<string, byte[]>();
@@ -228,7 +289,6 @@ namespace RustRelayReceiver
                     if (firstBoundary >= 0) { startPos = firstBoundary + boundaryRaw.Length; }
                     else { return files; }
                 }
-
                 if (startPos + 1 < bodyLength && bodyBytes[startPos] == '\r' && bodyBytes[startPos + 1] == '\n') { startPos += 2; }
                 else if (startPos < bodyLength && bodyBytes[startPos] == '\n') { startPos += 1; }
                 byte[] doubleCrlf = Encoding.UTF8.GetBytes("\r\n\r\n");
@@ -293,54 +353,121 @@ namespace RustRelayReceiver
             }
             return files;
         }
-
         private static async Task HandleWebSocketRequest(HttpListenerContext context)
         {
-            string? wipeId = "";
-            var query = context.Request.QueryString;
-            foreach (string? key in query.AllKeys) { if (key == "wipeId") { wipeId = query[key]; } }
+            WebSocket? webSocket = null;
+            WebSocketClient? client = null;
+            byte[]? buffer = null;
+            string? wipeId = context.Request.QueryString["wipeId"];
             try
             {
-                var wsContext = await context.AcceptWebSocketAsync(null);
-                var webSocket = wsContext.WebSocket;
+                var wsContext = await context.AcceptWebSocketAsync(subProtocol: null);
+                webSocket = wsContext.WebSocket;
                 LogDebug($"[WS] Client connected - wipeId={wipeId}, token={(!string.IsNullOrEmpty(_authToken))}");
                 TrackServerActivity(wipeId);
-                var client = new WebSocketClient
+                client = new WebSocketClient
                 {
                     Socket = webSocket,
                     WipeId = wipeId,
                     ConnectedAt = DateTime.UtcNow
                 };
-                var remoteIp = context.Request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
+                string? remoteIp = context.Request.RemoteEndPoint?.Address?.ToString() ?? "unknown";
                 _webSocketClients.AddOrUpdate(client, remoteIp, (_, __) => remoteIp);
-                byte[] buffer = _clientBuffers.GetOrAdd(client, _ => ArrayPool<byte>.Shared.Rent(65536));
-                while (webSocket.State == System.Net.WebSockets.WebSocketState.Open)
+                buffer = _clientBuffers.GetOrAdd(client, static _ => ArrayPool<byte>.Shared.Rent(65_536));
+                var fragmentBuffer = new List<byte[]>();
+                int fragmentTotalLength = 0;
+                while (webSocket.State == WebSocketState.Open)
                 {
+                    WebSocketReceiveResult result;
                     try
                     {
-                        var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-                        if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Close)
-                        {
-                            LogDebug($"[WS] Client disconnected - wipeId={wipeId}");
-                            break;
-                        }
-                        else if (result.MessageType == System.Net.WebSockets.WebSocketMessageType.Binary)
-                        {
-                            ProcessBinaryPacket(buffer.AsSpan(0, result.Count), result.Count, wipeId);
-                        }
+                        result = await webSocket.ReceiveAsync(buffer, CancellationToken.None);
                     }
-                    catch (Exception ex)
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (WebSocketException ex)
                     {
                         LogDebug($"[WS] Receive error: {ex.Message}");
                         break;
                     }
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        LogDebug($"[WS] Client disconnected - wipeId={wipeId}");
+                        break;
+                    }
+                    if (result.MessageType == WebSocketMessageType.Binary)
+                    {
+                        if (result.EndOfMessage == false)
+                        {
+                            byte[] fragmentCopy = new byte[result.Count];
+                            Buffer.BlockCopy(buffer, 0, fragmentCopy, 0, result.Count);
+                            fragmentBuffer.Add(fragmentCopy);
+                            fragmentTotalLength += result.Count;
+                        }
+                        else
+                        {
+                            byte[] completeData;
+                            if (fragmentBuffer.Count > 0)
+                            {
+                                byte[] finalFragment = new byte[result.Count];
+                                Buffer.BlockCopy(buffer, 0, finalFragment, 0, result.Count);
+                                fragmentBuffer.Add(finalFragment);
+                                fragmentTotalLength += result.Count;
+                                completeData = new byte[fragmentTotalLength];
+                                int destOffset = 0;
+                                foreach (var fragment in fragmentBuffer)
+                                {
+                                    Buffer.BlockCopy(fragment, 0, completeData, destOffset, fragment.Length);
+                                    destOffset += fragment.Length;
+                                }
+                                fragmentBuffer.Clear();
+                                fragmentTotalLength = 0;
+                            }
+                            else
+                            {
+                                completeData = new byte[result.Count];
+                                Buffer.BlockCopy(buffer, 0, completeData, 0, result.Count);
+                            }
+                            ProcessBinaryPacket(
+                          completeData.AsSpan(),
+                          completeData.Length,
+                            wipeId
+                        );
+                        }
+                    }
                 }
-                _webSocketClients.TryRemove(client, out _);
-                await webSocket.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
             }
-            catch (Exception ex) { LogDebug($"[WS] Connection error: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                LogDebug($"[WS] Connection error: {ex.Message}");
+            }
+            finally
+            {
+                if (client != null)
+                {
+                    _webSocketClients.TryRemove(client, out _);
+                    if (_clientBuffers.TryRemove(client, out var rented))
+                    {
+                        ArrayPool<byte>.Shared.Return(rented);
+                    }
+                }
+                if (webSocket is { State: WebSocketState.Open or WebSocketState.CloseReceived })
+                {
+                    try
+                    {
+                        await webSocket.CloseAsync(
+                            WebSocketCloseStatus.NormalClosure,
+                            "Closing",
+                            CancellationToken.None
+                        );
+                    }
+                    catch { }
+                }
+                webSocket?.Dispose();
+            }
         }
-
         private static async Task HandleHttpRequest(HttpListenerContext context)
         {
             var response = context.Response;
@@ -374,17 +501,18 @@ namespace RustRelayReceiver
                 {
                     await HandleIndexPage(context);
                 }
-                else if (path == "/favicon.ico")
+                else if (path.EndsWith("/favicon.ico"))
                 {
-                    if (File.Exists("favicon.ico")) { SafeWrite(context.Response, File.ReadAllBytes("favicon.ico"), "image/x-icon"); }
+                    var asm = Assembly.GetExecutingAssembly();
+                    using var stream = asm.GetManifestResourceStream("RustRelay9._0.Libs.favicon.ico");
+                    if (stream == null) { return; }
+                    using var ms = new MemoryStream((int)stream.Length);
+                    stream.CopyTo(ms);
+                    SafeWrite(context.Response, ms.GetBuffer(), "image/x-icon");
                 }
                 else if (path == "/api/servers")
                 {
                     await HandleServersApi(context);
-                }
-                else if (path == "/api/server/")
-                {
-                    await HandleServerDetailApi(context);
                 }
                 else if (path.StartsWith("/api/server/"))
                 {
@@ -448,217 +576,32 @@ namespace RustRelayReceiver
             response.Close();
         }
 
-        private static void HandleNetworkPacket(MessageType type, ReadOnlySpan<byte> packet, string? wipeId)
-        {
-            if (string.IsNullOrEmpty(wipeId)) { return; }
-            try
-            {
-                switch (type)
-                {
-                    case MessageType.Entities:
-                        try { DecodeEntities(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[Entities] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.EntityPosition:
-                        try { DecodeEntityPosition(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[EntityPosition] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.EntityDestroy:
-                        try { DecodeEntityDestroy(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[EntityDestroy] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.RPCMessage:
-                        try { DecodeRPCMessage(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[RPCMessage] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.Effect:
-                        try { DecodeEffect(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[Effect] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.VoiceData:
-                        try { DecodeVoiceData(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[VoiceData] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    case MessageType.EntityFlags:
-                        try { DecodeEntityFlags(packet, wipeId); }
-                        catch (Exception ex)
-                        {
-                            LogDebug($"[EntityFlags] wipeId={wipeId} {ex}");
-                        }
-                        break;
-
-                    default:
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                LogDebug($"[HandleNetworkPacket] type={type} wipeId={wipeId} {ex}");
-            }
-        }
-
-        private static void DecodeVoiceData(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 12) return;
-            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
-            int dataLength = BinaryPrimitives.ReadInt32LittleEndian(packet[8..]);
-            if (dataLength > 0 && packet.Length >= 12 + dataLength) { }
-            LogDebug($"[Voice] Wipe={wipeId} Entity={entityId} is data {dataLength}");
-        }
-
-        private static void DecodeEntityFlags(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 12) return;
-            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
-            int rawFlags = BinaryPrimitives.ReadInt32LittleEndian(packet[8..]);
-            if (_entitiesByWipe.TryGetValue(wipeId, out var entities) && entities.TryGetValue(entityId, out var entity))
-            {
-                entity.UpdateFlags(rawFlags);
-                OnEntityUpdated?.Invoke(entity, wipeId);
-            }
-        }
-
-        private static void DecodeEffect(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            try
-            {
-                var effect = DeserializeEffect(packet);
-                string? name = Path.GetFileName(GetStringFromPool(wipeId, effect.pooledstringid));
-                if (effect.pooledstringid != 0)
-                {
-                    var tracked = new TrackedEffect()
-                    {
-                        Id = effect.pooledstringid,
-                        pos = effect.origin,
-                        PrefabName = name
-                    };
-                    LogDebug($"[EFFECT] Wipe={wipeId} Type={effect.type} Origin=({effect.origin}) Name=({name})");
-                    if (_effectsByWipe.TryGetValue(wipeId, out var effects)) { effects[effect.pooledstringid] = tracked; }
-                    OnEffectDecoded?.Invoke(effect, wipeId);
-                }
-            }
-            catch { }
-        }
-
-        private static byte[] GetEntitiesJson(string wipeId)
-        {
-            if (!_entitiesByWipe.TryGetValue(wipeId, out var entities)) { return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}"); }
-            _effectsByWipe.TryGetValue(wipeId, out var effects);
-            int entityCount = 0;
-            foreach (var entity in entities.Values)
-                if (entity.pos != null) entityCount++;
-
-            int effectCount = 0;
-            if (effects != null)
-                foreach (var effect in effects.Values)
-                    if (effect.pos != null) effectCount++;
-
-            using var stream = new MemoryStream();
-            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false });
-            writer.WriteStartObject();
-            writer.WriteNumber("timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            writer.WriteString("wipeId", wipeId);
-            writer.WriteNumber("entityCount", entityCount);
-            writer.WriteNumber("effectCount", effectCount);
-            writer.WriteStartArray("entities");
-            foreach (var entity in entities.Values)
-            {
-                if (entity.pos == null) { continue; }
-                writer.WriteStartObject();
-                writer.WriteNumber("id", entity.Id);
-                writer.WriteNumber("prefabId", entity.PrefabId);
-                writer.WriteString("prefabName", entity.PrefabName ?? "");
-                writer.WriteNumber("groupId", entity.GroupId);
-                writer.WriteStartObject("pos");
-                writer.WriteNumber("x", entity.pos.X);
-                writer.WriteNumber("y", entity.pos.Y);
-                writer.WriteNumber("z", entity.pos.Z);
-                writer.WriteEndObject();
-                if (entity.rot != null)
-                {
-                    writer.WriteStartObject("rot");
-                    writer.WriteNumber("x", entity.rot.X);
-                    writer.WriteNumber("y", entity.rot.Y);
-                    writer.WriteNumber("z", entity.rot.Z);
-                    writer.WriteEndObject();
-                }
-                writer.WriteNumber("flags", entity.Flags);
-                writer.WriteBoolean("isdestroyed", entity.isDestroyed);
-                writer.WriteEndObject();
-            }
-            writer.WriteEndArray();
-            writer.WriteStartArray("effects");
-            if (effects != null)
-            {
-                foreach (var effect in effects.Values)
-                {
-                    if (effect.pos == null) { continue; }
-                    writer.WriteStartObject();
-                    writer.WriteNumber("id", effect.Id);
-                    writer.WriteString("prefabName", effect.PrefabName ?? "");
-                    writer.WriteStartObject("pos");
-                    writer.WriteNumber("x", effect.pos.X);
-                    writer.WriteNumber("y", effect.pos.Y);
-                    writer.WriteNumber("z", effect.pos.Z);
-                    writer.WriteEndObject();
-                    writer.WriteEndObject();
-                }
-            }
-            writer.WriteEndArray();
-            writer.WriteEndObject();
-            writer.Flush();
-            return stream.ToArray();
-        }
-
-        private static byte[] GetEntitiesUpdatedSinceJson(string wipeId, float? cameraX, float? cameraY, float? cameraZ, bool unlimitedView)
+        private static byte[] GetEntitiesJson(string wipeId, float? cameraX = null, float? cameraY = null, float? cameraZ = null, bool unlimitedView = false)
         {
             const float DEFAULT_DISTANCE = 1000f;
+            Dictionary<ulong, (float x, float y, float z)> _entityLastRotation = new();
             if (!_entitiesByWipe.TryGetValue(wipeId, out var entities)) { return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}"); }
             _effectsByWipe.TryGetValue(wipeId, out var effects);
             int entityCount = 0;
             int effectCount = 0;
-            List<ulong>? toRemove = null;
+            List<ulong> toRemove = new();
+            List<ulong> rotationChangedIds = new();
             foreach (var entity in entities.Values)
             {
-                if (entity.pos != null)
-                {
-                    entityCount++;
-                    if (entity.isDestroyed)
-                    {
-                        toRemove ??= new();
-                        toRemove.Add(entity.Id);
-                    }
-                }
+                entityCount++;
+                if (entity.isDestroyed) toRemove.Add(entity.Id);
             }
-            if (effects != null)
+            foreach (var entity in entities.Values)
             {
-                foreach (var effect in effects.Values)
-                    if (effect.pos != null) effectCount++;
+                if (entity.pos.x == 0 && entity.pos.y == 0 && entity.pos.z == 0) continue;
+                if (_entityLastRotation.TryGetValue(entity.Id, out var lastRot))
+                {
+                    if (MathF.Abs(entity.rot.x - lastRot.x) > 0.001f || MathF.Abs(entity.rot.y - lastRot.y) > 0.001f || MathF.Abs(entity.rot.z - lastRot.z) > 0.001f)
+                        rotationChangedIds.Add(entity.Id);
+                }
+                else { rotationChangedIds.Add(entity.Id); }
             }
+            if (effects != null) foreach (var effect in effects.Values) effectCount++;
             using var stream = new MemoryStream();
             using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false });
             writer.WriteStartObject();
@@ -669,35 +612,52 @@ namespace RustRelayReceiver
             writer.WriteStartArray("entities");
             foreach (var entity in entities.Values)
             {
-                if (entity.pos == null) { continue; }
+                if (entity.Parent != 0 && !string.IsNullOrEmpty(entity.Playername) && entities.TryGetValue(entity.Parent, out var parentEntity))
+                {
+                    entity.pos.x += parentEntity.pos.x;
+                    entity.pos.y += parentEntity.pos.y;
+                    entity.pos.z += parentEntity.pos.z;
+                }
+                if (entity.pos.x == 0 && entity.pos.y == 0 && entity.pos.z == 0) continue;
                 if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
                 {
-                    float dx = entity.pos.X - cameraX.Value;
-                    float dz = entity.pos.Z - cameraZ.Value;
-                    float horizontalDist = MathF.Sqrt(dx * dx + dz * dz);
-                    if (horizontalDist > DEFAULT_DISTANCE) { continue; }
+                    float dx = entity.pos.x - cameraX.Value, dz = entity.pos.z - cameraZ.Value;
+                    if (MathF.Sqrt(dx * dx + dz * dz) > DEFAULT_DISTANCE) continue;
                 }
+                bool hasRotationChange = rotationChangedIds.Contains(entity.Id);
                 writer.WriteStartObject();
                 writer.WriteNumber("id", entity.Id);
                 writer.WriteNumber("prefabId", entity.PrefabId);
                 writer.WriteString("prefabName", entity.PrefabName ?? "");
                 writer.WriteNumber("groupId", entity.GroupId);
                 writer.WriteStartObject("pos");
-                writer.WriteNumber("x", entity.pos.X);
-                writer.WriteNumber("y", entity.pos.Y);
-                writer.WriteNumber("z", entity.pos.Z);
+                writer.WriteNumber("x", entity.pos.x);
+                writer.WriteNumber("y", entity.pos.y);
+                writer.WriteNumber("z", entity.pos.z);
                 writer.WriteEndObject();
-                if (entity.rot != null)
-                {
-                    writer.WriteStartObject("rot");
-                    writer.WriteNumber("x", entity.rot.X);
-                    writer.WriteNumber("y", entity.rot.Y);
-                    writer.WriteNumber("z", entity.rot.Z);
-                    writer.WriteEndObject();
-                }
+                writer.WriteStartObject("rot");
+                writer.WriteNumber("x", entity.rot.x);
+                writer.WriteNumber("y", entity.rot.y);
+                writer.WriteNumber("z", entity.rot.z);
+                writer.WriteEndObject();
                 writer.WriteNumber("flags", entity.Flags);
                 writer.WriteBoolean("isdestroyed", entity.isDestroyed);
+                if (hasRotationChange) writer.WriteNumber("rotUpdated", 1);
+                writer.WriteString("typeClass", entity.TypeClass ?? "");
+                if (entity.MaxHealth.HasValue && entity.MaxHealth.Value > 0) writer.WriteNumber("maxHealth", entity.MaxHealth.Value);
+                if (entity.Durability.HasValue) writer.WriteNumber("durability", entity.Durability.Value);
+                if (entity.MaxDurability.HasValue && entity.MaxDurability.Value > 0) writer.WriteNumber("maxDurability", entity.MaxDurability.Value);
+                if (entity.Ammo.HasValue) writer.WriteNumber("ammo", entity.Ammo.Value);
+                if (entity.MaxAmmo.HasValue) writer.WriteNumber("maxAmmo", entity.MaxAmmo.Value);
+                if (entity.OwnerId.HasValue && entity.OwnerId.Value != 0) writer.WriteNumber("ownerId", entity.OwnerId.Value);
+                if (!string.IsNullOrEmpty(entity.OwnerName)) writer.WriteString("ownerName", entity.OwnerName);
+                if (entity.Extra != null && entity.Extra.Count > 0)
+                {
+                    writer.WritePropertyName("extra");
+                    writer.WriteRawValue(System.Text.Json.JsonSerializer.Serialize(entity.Extra));
+                }
                 writer.WriteEndObject();
+                _entityLastRotation[entity.Id] = (entity.rot.x, entity.rot.y, entity.rot.z);
             }
             writer.WriteEndArray();
             writer.WriteStartArray("effects");
@@ -705,21 +665,18 @@ namespace RustRelayReceiver
             {
                 foreach (var effect in effects.Values)
                 {
-                    if (effect.pos == null) continue;
                     if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
                     {
-                        float dx = effect.pos.X - cameraX.Value;
-                        float dz = effect.pos.Z - cameraZ.Value;
-                        float horizontalDist = MathF.Sqrt(dx * dx + dz * dz);
-                        if (horizontalDist > DEFAULT_DISTANCE) { continue; }
+                        float dx = effect.pos.x - cameraX.Value, dz = effect.pos.z - cameraZ.Value;
+                        if (MathF.Sqrt(dx * dx + dz * dz) > DEFAULT_DISTANCE) continue;
                     }
                     writer.WriteStartObject();
                     writer.WriteNumber("id", effect.Id);
                     writer.WriteString("prefabName", effect.PrefabName ?? "");
                     writer.WriteStartObject("pos");
-                    writer.WriteNumber("x", effect.pos.X);
-                    writer.WriteNumber("y", effect.pos.Y);
-                    writer.WriteNumber("z", effect.pos.Z);
+                    writer.WriteNumber("x", effect.pos.x);
+                    writer.WriteNumber("y", effect.pos.y);
+                    writer.WriteNumber("z", effect.pos.z);
                     writer.WriteEndObject();
                     writer.WriteEndObject();
                 }
@@ -727,243 +684,181 @@ namespace RustRelayReceiver
             writer.WriteEndArray();
             writer.WriteEndObject();
             writer.Flush();
-            if (toRemove != null)
+            foreach (var id in toRemove)
             {
-                foreach (var id in toRemove)
-                    entities.TryRemove(id, out _);
+                entities.TryRemove(id, out _);
+                _entityLastRotation.Remove(id);
             }
             return stream.ToArray();
-        }
-
-        private static void DecodeEntityPosition(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 32) return;
-            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
-            float px = BinaryPrimitives.ReadSingleLittleEndian(packet[8..]);
-            float py = BinaryPrimitives.ReadSingleLittleEndian(packet[12..]);
-            float pz = BinaryPrimitives.ReadSingleLittleEndian(packet[16..]);
-            float rx = BinaryPrimitives.ReadSingleLittleEndian(packet[20..]);
-            float ry = BinaryPrimitives.ReadSingleLittleEndian(packet[24..]);
-            float rz = BinaryPrimitives.ReadSingleLittleEndian(packet[28..]);
-            if (_entitiesByWipe.TryGetValue(wipeId, out var entities) && entities.TryGetValue(entityId, out var entity))
-            {
-                entity.UpdatePosition(px, py, pz, rx, ry, rz);
-                OnEntityUpdated?.Invoke(entity, wipeId);
-            }
-        }
-
-        private static void DecodeEntityDestroy(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 8) return;
-            ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(packet);
-            if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
-            {
-                if (entities.TryGetValue(entityId, out var entity))
-                {
-                    entity.isDestroyed = true;
-                }
-            }
-            LogDebug($"[DESTROY] Wipe={wipeId} Entity={entityId}");
-            OnEntityDestroyed?.Invoke(wipeId, entityId);
-        }
-
-        private static void DecodeRPCMessage(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 12) { return; }
-            ulong targetEntity = BinaryPrimitives.ReadUInt64LittleEndian(packet);
-            uint rpcId = BinaryPrimitives.ReadUInt32LittleEndian(packet[8..]);
-            string? RPCName = GetStringFromPool(wipeId, rpcId);
-            LogDebug($"[RPC] Wipe={wipeId} Entity={targetEntity} RPCId={rpcId}");
-        }
-
-        public static EffectData DeserializeEffect(ReadOnlySpan<byte> buffer)
-        {
-            var r = new ProtoReader(buffer);
-            var e = new EffectData();
-
-            while (!r.EOF)
-            {
-                uint tag = r.ReadTag();
-                if (tag == 0) { break; }
-                uint field = tag >> 3;
-                uint wire = tag & 7;
-                switch (field)
-                {
-                    case 1: e.type = (int)r.ReadVarUInt32(); break;
-                    case 2: e.pooledstringid = r.ReadVarUInt32(); break;
-                    case 3: e.number = (int)r.ReadVarUInt32(); break;
-                    case 4: e.origin = ProtoVector3.Deserialize(r.ReadBytes()); break;
-                    case 5: e.normal = ProtoVector3.Deserialize(r.ReadBytes()); break;
-                    case 6: e.scale = r.ReadFixed32(); break;
-                    case 7: e.entity = r.ReadVarUInt64(); break;
-                    case 8: e.bone = r.ReadVarUInt32(); break;
-                    case 9: e.source = r.ReadVarUInt64(); break;
-                    case 10: e.distanceOverride = r.ReadFixed32(); break;
-                    case 11: e.ignoreMaxSpawnDistance = r.ReadVarUInt32() != 0; break;
-                    case 12: e.sourceEntity = r.ReadVarUInt64(); break;
-                    default: r.Skip(wire); break;
-                }
-            }
-            return e;
         }
 
         private static void ProcessBinaryPacket(ReadOnlySpan<byte> buffer, int length, string? wipeId)
         {
+            if (string.IsNullOrEmpty(wipeId)) { return; }
             Interlocked.Increment(ref _totalPacketsReceived);
             UpdateServerStats(wipeId, length);
             if (buffer.Length < 4) { return; }
-
             if (buffer.Length == MarkerLength && BinaryPrimitives.TryReadInt32LittleEndian(buffer, out int magic) && magic == MarkerMagic)
             {
                 long serverTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer[4..]);
                 HandleMarker(wipeId, serverTicks);
                 return;
             }
-            int packetId = buffer[0];
-            if (packetId < 140) { return; }
-            var type = (MessageType)(packetId - 140);
-            HandleNetworkPacket(type, buffer[1..], wipeId);
-        }
-
-        private static void DecodeEntities(ReadOnlySpan<byte> packet, string wipeId)
-        {
-            if (packet.Length < 4) return;
-            var entity = ReadEntity(packet);
-            if (entity.HasValue && entity.Value.baseNetworkable.HasValue)
+            int offset = 0;
+            if (offset + 1 > buffer.Length) return;
+            byte type = buffer[offset];
+            offset += 1;
+            if (type <= 140) return;
+            type -= 140;
+            switch ((MessageType)type)
             {
-                var bn = entity.Value.baseNetworkable.Value;
-                var tracked = new TrackedEntity
-                {
-                    Id = bn.uid.Value,
-                    PrefabId = bn.prefabID,
-                    GroupId = bn.group,
-                    PrefabName = Path.GetFileName(GetStringFromPool(wipeId, bn.prefabID))
-                };
-
-                if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
-                {
-                    entities[tracked.Id] = tracked;
-                    LogDebug($"[SPAWN] Wipe={wipeId} Prefab={bn.prefabID} NETID={bn.uid.Value}");
-                    OnEntityCreated?.Invoke(tracked, wipeId);
-                }
-            }
-        }
-
-        private static Entity? ReadEntity(ReadOnlySpan<byte> data)
-        {
-            var entity = new Entity();
-            int index = 4;
-            try
-            {
-                while (index < data.Length)
-                {
-                    byte tag = data[index];
-                    int fieldNumber = tag >> 3;
-                    int wireType = tag & 0x07;
-                    index++;
-
-                    switch (fieldNumber)
+                case MessageType.GroupEnter:
+                case MessageType.GroupLeave:
+                    return;
+                case MessageType.Entities:
+                    if (offset + sizeof(uint) > buffer.Length) { return; }
+                    offset += sizeof(uint);
+                    int entityDataLength = buffer.Length - offset;
+                    if (entityDataLength <= 0) { return; }
+                    ReadOnlySpan<byte> entityBytes = buffer[offset..];
+                    var entity = Entity.Deserialize(entityBytes.ToArray());
+                    if (entity != null && entity.baseNetworkable != null)
                     {
-                        case 1:
-                            if (wireType == 2) { entity.baseNetworkable = ReadBaseNetworkable(data, ref index); }
-                            else { index += SkipField(data, wireType); }
-                            break;
+                        var bn = entity.baseNetworkable;
+                        ulong pid = 0;
+                        if (entity.parent != null)
+                        {
+                            pid = entity.parent.uid.Value;
+                        }
+                        string pname = entity.basePlayer?.name ?? "";
+                        float h = entity.baseCombat?.health ?? entity?.baseCombat?.health ?? 0f;
+                        var tracked = new TrackedEntity
+                        {
+                            Id = bn.uid.Value,
+                            PrefabId = bn.prefabID,
+                            GroupId = bn.group,
+                            PrefabName = Path.GetFileName(GetStringFromPool(wipeId, bn.prefabID)),
+                            Parent = pid,
+                            Playername = pname,
+                            Health = h,
+                            TypeClass = entity?.GetType().Name,
+                            MaxHealth = entity?.baseCombat?.maxHealth ?? entity?.baseCombat?.maxHealth,
+                        };
 
-                        default:
-                            index += SkipField(data, wireType);
-                            break;
+                        tracked.Extra ??= new();
+                        if (entity?.basePlayer != null)
+                        {
+                            tracked.Extra["stamina"] = entity.basePlayer.metabolism.heartrate;
+                            tracked.Extra["food"] = entity.basePlayer.metabolism.calories;
+                            tracked.Extra["water"] = entity.basePlayer.metabolism.hydration;
+                        }
+                        else if (entity?.worldItem != null)
+                        {
+                            tracked.Extra["itemID"] = entity.worldItem.item.itemid;
+                            tracked.Extra["stackCount"] = entity.worldItem.item.amount;
+                        }
+                        else if (entity?.buildingBlock != null)
+                        {
+                            tracked.Extra["construction"] = entity.buildingBlock.grade;
+                        }
+                        else if (entity?.baseNPC != null)
+                        {
+                            tracked.Extra["npcClass"] = entity.baseNPC.GetType().Name;
+                        }
+
+                        if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
+                        {
+                            entities[tracked.Id] = tracked;
+                            LogDebug($"[SPAWN] Wipe={wipeId} Prefab={bn.prefabID} NETID={bn.uid.Value}");
+                            OnEntityCreated?.Invoke(tracked, wipeId);
+                        }
                     }
-                }
+                    break;
+                case MessageType.Message:
+                    break;
+                case MessageType.VoiceData:
+                    break;
+                case MessageType.EntityDestroy:
+                    if (offset + sizeof(ulong) + sizeof(byte) > buffer.Length) return;
+                    ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                    offset += sizeof(ulong);
+                    offset += sizeof(byte);
+                    if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesDel))
+                    {
+                        if (entitiesDel.TryGetValue(entityId, out var entityDel))
+                        {
+                            entityDel.isDestroyed = true;
+                        }
+                    }
+                    LogDebug($"[DESTROY] Wipe={wipeId} Entity={entityId}");
+                    OnEntityDestroyed?.Invoke(wipeId, entityId);
+                    break;
+                case MessageType.EntityPosition:
+                    int minPositionSize = sizeof(ulong) + (sizeof(float) * 7);
+                    if (offset + minPositionSize > buffer.Length) return;
+                    entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                    offset += sizeof(ulong);
+                    float posX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float posY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float posZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float rotX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float rotY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float rotZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    float time = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                    offset += sizeof(float);
+                    ulong parentId = 0;
+                    if (offset + sizeof(ulong) <= buffer.Length)
+                    {
+                        parentId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                    }
+                    if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesPos) &&
+                        entitiesPos.TryGetValue(entityId, out var entityPos))
+                    {
+                        entityPos.UpdatePosition(posX, posY, posZ, rotX, rotY, rotZ);
+                        OnEntityUpdated?.Invoke(entityPos, wipeId);
+                    }
+                    break;
+                case MessageType.Effect:
+                    if (offset + sizeof(uint) > buffer.Length) { return; }
+                    int effectDataLength = buffer.Length - offset;
+                    if (effectDataLength <= 0) { return; }
+                    ReadOnlySpan<byte> effectBytes = buffer[offset..];
+                    var effect = EffectData.Deserialize(effectBytes.ToArray());
+                    if (effect != null)
+                    {
+                        if (effect.pooledstringid != 0)
+                        {
+                            string? name = Path.GetFileName(GetStringFromPool(wipeId, effect.pooledstringid));
+                            ulong effectId = (ulong)effect.pooledstringid;
+                            var tracked = new TrackedEffect()
+                            {
+                                Id = effectId,
+                                pos = effect.origin,
+                                PrefabName = name
+                            };
+                            var effects = _effectsByWipe.GetOrAdd(wipeId, _ => new ConcurrentDictionary<ulong, TrackedEffect>());
+                            effects[effectId] = tracked;
+                            LogDebug($"[EFFECT] Wipe={wipeId} Added ID={effectId} Name={name}");
+                            OnEffectDecoded?.Invoke(effect, wipeId);
+                        }
+                    }
+                    break;
+                case MessageType.RPCMessage:
+                    if (offset + sizeof(ulong) + sizeof(uint) > buffer.Length) { return; }
+                    entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                    offset += sizeof(ulong);
+                    uint rpcId = BinaryPrimitives.ReadUInt32LittleEndian(buffer[offset..]);
+                    LogDebug($"[RPC] Wipe={wipeId} Entity={entityId} RPC={rpcId}");
+                    OnRPCReceived?.Invoke(wipeId, entityId, rpcId);
+                    break;
             }
-            catch { }
-            return entity;
         }
-
-        private static BaseNetworkable? ReadBaseNetworkable(ReadOnlySpan<byte> data, ref int index)
-        {
-            var instance = new BaseNetworkable();
-            uint length = ReadVarUInt32(data, ref index);
-            int limit = index + (int)length;
-            while (index < limit)
-            {
-                byte tag = data[index++];
-                switch (tag)
-                {
-                    case 8:
-                        instance.uid = new NetworkableId(ReadVarUInt64(data, ref index));
-                        break;
-
-                    case 16:
-                        instance.group = ReadVarUInt32(data, ref index);
-                        break;
-
-                    case 24:
-                        instance.prefabID = ReadVarUInt32(data, ref index);
-                        break;
-
-                    default:
-                        SkipUnknownField(data, ref index, tag);
-                        break;
-                }
-            }
-            if (index != limit) { throw new Exception("Read past max limit"); }
-            return instance;
-        }
-
-        private static uint ReadVarUInt32(ReadOnlySpan<byte> data, ref int index)
-        {
-            uint result = 0;
-            int shift = 0;
-            while (true)
-            {
-                byte b = data[index++];
-                result |= (uint)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) { return result; }
-                shift += 7;
-                if (shift > 35) { throw new Exception("Bad VarUInt32"); }
-            }
-        }
-
-        private static ulong ReadVarUInt64(ReadOnlySpan<byte> data, ref int index)
-        {
-            ulong result = 0;
-            int shift = 0;
-            while (true)
-            {
-                byte b = data[index++];
-                result |= (ulong)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) { return result; }
-                shift += 7;
-                if (shift > 70) { throw new Exception("Bad VarUInt64"); }
-            }
-        }
-
-        private static void SkipUnknownField(ReadOnlySpan<byte> data, ref int index, byte tag)
-        {
-            int wireType = tag & 0x07;
-            switch (wireType)
-            {
-                case 0: while ((data[index++] & 0x80) != 0) { } return;
-                case 1: index += 8; return;
-                case 2: uint len = ReadVarUInt32(data, ref index); index += (int)len; return;
-                case 5: index += 4; return;
-                default: throw new Exception($"Unsupported wire type: {wireType}");
-            }
-        }
-
-        private static int SkipField(ReadOnlySpan<byte> data, int wireType)
-        {
-            int pos = 0;
-            return wireType switch
-            {
-                0 => 1,
-                1 => 8,
-                2 => 1 + (int)ReadVarUInt32(data, ref pos) + pos,
-                5 => 4,
-                _ => 0
-            };
-        }
-
         private static async Task HandleModels(HttpListenerContext ctx)
         {
             if (ctx.Request.Url == null) { return; }
@@ -980,15 +875,8 @@ namespace RustRelayReceiver
                 ctx.Response.Close();
                 return;
             }
-            if (!File.Exists(canonicalPath))
-            {
-                ctx.Response.StatusCode = 404;
-                ctx.Response.Close();
-                return;
-            }
             string extension = Path.GetExtension(fileName).ToLowerInvariant();
-            string contentType = "";
-            contentType = extension switch
+            string contentType = extension switch
             {
                 ".glb" => "model/gltf-binary",
                 ".gltf" => "model/gltf+json",
@@ -1021,19 +909,16 @@ namespace RustRelayReceiver
                 ctx.Response.OutputStream.Close();
             }
         }
-
         private static void HandleMarker(string? wipeId, long serverTicks)
         {
             if (wipeId == null) return;
         }
-
         private static async Task HandleIndexPage(HttpListenerContext context)
         {
             var response = context.Response;
             bool isAuthenticated = HasAuth(context, true);
             await SendHtmlResponse(response, 200, HTML.GetIndexHtmlBytes(isAuthenticated));
         }
-
         private static async Task HandleServersApi(HttpListenerContext context)
         {
             var response = context.Response;
@@ -1041,13 +926,11 @@ namespace RustRelayReceiver
             var serversList = _connectedServers.Values.ToList();
             await SendJsonResponse(response, 200, new { servers = serversList });
         }
-
         private static ServerInfo? GetServerByWipeId(string? wipeId)
         {
             if (string.IsNullOrEmpty(wipeId)) return null;
             return _connectedServers.TryGetValue(wipeId, out var server) ? server : null;
         }
-
         private static async Task HandleServerDetailApi(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1157,7 +1040,6 @@ namespace RustRelayReceiver
                 mapInfo = LoadMapInfo(wipeId)
             });
         }
-
         private static async Task HandlePathsApi(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1171,7 +1053,7 @@ namespace RustRelayReceiver
             try
             {
                 WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
-                if (worldSerialization == null)
+                if (worldSerialization == null || worldSerialization.world == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
                     return;
@@ -1187,7 +1069,6 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 500, new { error = ex.Message });
             }
         }
-
         private static async Task HandlePrefabsApi(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1202,7 +1083,7 @@ namespace RustRelayReceiver
             try
             {
                 WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
-                if (worldSerialization == null)
+                if (worldSerialization == null || worldSerialization.world == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
                     return;
@@ -1232,7 +1113,6 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 500, new { error = ex.Message });
             }
         }
-
         private static async Task HandleMapDataApi(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1245,7 +1125,7 @@ namespace RustRelayReceiver
             try
             {
                 WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
-                if (worldSerialization == null)
+                if (worldSerialization == null || worldSerialization.world == null)
                 {
                     await SendJsonResponse(response, 404, new { error = "No maps found" });
                     return;
@@ -1266,7 +1146,6 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 500, new { error = ex.Message });
             }
         }
-
         private static async Task HandleFileDownload(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1329,7 +1208,6 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             }
         }
-
         private static async Task Handle3DEntitiesData(HttpListenerContext context)
         {
             if (!HasAuth(context)) { return; }
@@ -1373,7 +1251,6 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             }
         }
-
         private static async Task Handle3DUpdateData(HttpListenerContext context)
         {
             if (!HasAuth(context)) { return; }
@@ -1408,7 +1285,7 @@ namespace RustRelayReceiver
             }
             try
             {
-                byte[] jsonBytes = GetEntitiesUpdatedSinceJson(wipeId, cameraX, cameraY, cameraZ, unlimitedView);
+                byte[] jsonBytes = GetEntitiesJson(wipeId, cameraX, cameraY, cameraZ, unlimitedView);
                 response.AddHeader("Content-Encoding", "gzip");
                 response.ContentType = "application/json";
                 using (var ms = new MemoryStream())
@@ -1431,7 +1308,6 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             }
         }
-
         private static JsonSerializerOptions GetOptions()
         {
             return new JsonSerializerOptions
@@ -1440,7 +1316,6 @@ namespace RustRelayReceiver
                 PropertyNamingPolicy = JsonNamingPolicy.CamelCase
             };
         }
-
         private static async Task Handle3DMapData(HttpListenerContext context, JsonSerializerOptions options)
         {
             if (!HasAuth(context)) { return; }
@@ -1481,7 +1356,7 @@ namespace RustRelayReceiver
                 try
                 {
                     WorldSerialization? worldSerialization = GetCachedWorldSerialization(wipeId);
-                    if (worldSerialization == null)
+                    if (worldSerialization == null || worldSerialization.world == null)
                     {
                         string errmsg = $"[3DMAP] Error: Can't Load World File {wipeId}";
                         LogDebug(errmsg);
@@ -1565,16 +1440,15 @@ namespace RustRelayReceiver
                                 });
                                 continue;
                             }
-                            else if (name.Contains("monument") || name.Contains("unique_environment") || name.Contains("tunnel-entrance") || name.Contains("platform") || name.Contains("power substations") || name.Contains("iceberg") || name.Contains("ice_lakes"))
+                            else if (name.Contains("monument") || name.Contains("unique_environment") || name.Contains("tunnel-entrance") || name.Contains("platform") || name.Contains("power substations") || name.Contains("iceberg") || name.Contains("ice_lakes") || name.Contains("assets/bundled/prefabs/static") || name.Contains("modding/lootables") || name.Contains("modding/volumes_and_triggers") || name.Contains("io/electric"))
                             {
                                 Vector3 postion = pd.position;
-                                if (postion.Y <= -499) { postion.Y = 0; }
+                                if (postion.y <= -499) { postion.y = 0; }
                                 name = Path.GetFileNameWithoutExtension(name);
                                 if (name.Contains("desert_military_base")) { name = "desert_military_base"; }
                                 else if (name.Contains("mining_quarry")) { name = "mining_quarry"; }
                                 else if (name.Contains("powerlineplatform")) { name = "powerlineplatform"; }
                                 else if (name.Contains("entrance_bunker")) { name = "entrance_bunker"; }
-                                else if (name.Contains("underwater_lab")) { name = "underwater_lab"; }
                                 prefabs.Add(new
                                 {
                                     Name = name,
@@ -1624,12 +1498,11 @@ namespace RustRelayReceiver
                     prefabs,
                     river = mapRivers
                 };
-
                 response.AddHeader("Content-Encoding", "gzip");
                 byte[] compressedBytes;
                 using (var ms = new MemoryStream())
                 {
-                    using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
+                    using (var gzip = new GZipStream(ms, CompressionLevel.Optimal, leaveOpen: true))
                     {
                         JsonSerializer.Serialize(gzip, terrainData, options);
                     }
@@ -1647,7 +1520,6 @@ namespace RustRelayReceiver
                 await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
             }
         }
-
         private static async Task Serve3DViewer(HttpListenerContext context)
         {
             if (!HasAuth(context)) { return; }
@@ -1661,7 +1533,6 @@ namespace RustRelayReceiver
             }
             await SendHtmlResponse(context.Response, 200, HTML.Get3DViewerHtmlBytes(wipeId));
         }
-
         private static async Task HandleServerDetailPage(HttpListenerContext context)
         {
             if (!HasAuth(context)) { return; }
@@ -1682,7 +1553,6 @@ namespace RustRelayReceiver
             }
             await SendHtmlResponse(response, 200, HTML.GetServerDetailHtmlBytes(wipeId, isAuthenticated));
         }
-
         public static string? DecryptMapDataName(int PreFabCount, string? EncryptedData)
         {
             try
@@ -1707,7 +1577,6 @@ namespace RustRelayReceiver
             }
             catch { return EncryptedData; }
         }
-
         public static string EncryptMapDataName(int PreFabCount, string DataName)
         {
             try
@@ -1734,7 +1603,6 @@ namespace RustRelayReceiver
             catch { }
             return DataName;
         }
-
         private static async Task HandleLoginApi(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1759,12 +1627,10 @@ namespace RustRelayReceiver
             }
             await SendJsonResponse(response, success ? 200 : 401, new { success });
         }
-
         private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, string html, Dictionary<string, string>? additionalHeaders = null)
         {
             response.StatusCode = statusCode;
             response.ContentType = "text/html; charset=utf-8";
-
             if (additionalHeaders != null)
             {
                 foreach (var header in additionalHeaders)
@@ -1773,17 +1639,14 @@ namespace RustRelayReceiver
                     else { response.Headers.Add(header.Key, header.Value); }
                 }
             }
-
             byte[] buffer = Encoding.UTF8.GetBytes(html);
             response.ContentLength64 = buffer.Length;
             await response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
         }
-
         private static async Task SendHtmlResponse(HttpListenerResponse response, int statusCode, byte[] html, Dictionary<string, string>? additionalHeaders = null)
         {
             response.StatusCode = statusCode;
             response.ContentType = "text/html; charset=utf-8";
-
             if (additionalHeaders != null)
             {
                 foreach (var header in additionalHeaders)
@@ -1795,7 +1658,6 @@ namespace RustRelayReceiver
             response.ContentLength64 = html.Length;
             await response.OutputStream.WriteAsync(html, 0, html.Length);
         }
-
         private static async Task HandleStringPoolUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
@@ -1820,14 +1682,12 @@ namespace RustRelayReceiver
             catch (Exception ex)
             {
                 LogDebug($"[StringPool] Parse error: {ex.Message}");
-
                 await SendJsonResponse(response, 400, new
                 {
                     error = "Invalid JSON format"
                 });
             }
         }
-
         private static async Task HandleManifestUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
@@ -1851,7 +1711,6 @@ namespace RustRelayReceiver
                 }
             }
         }
-
         private static async Task HandleSnapshotUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
@@ -1874,7 +1733,6 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 400, new { error = ex.Message });
             }
         }
-
         private static async Task HandleMapSnapshotUpload(HttpListenerContext context, string? wipeId)
         {
             var request = context.Request;
@@ -1896,7 +1754,6 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 400, new { error = ex.Message });
             }
         }
-
         private static MapInfo? LoadMapInfo(string wipeId)
         {
             var mapInfo = new MapInfo();
@@ -1908,11 +1765,11 @@ namespace RustRelayReceiver
                 var splat = worldSerialization.GetMap("splat")?.data;
                 if (topology == null || splat == null) { return null; }
                 int[] Topology = new int[topology.Length];
-                if (Topology == null) { return null; }
                 Buffer.BlockCopy(topology, 0, Topology, 0, topology.Length);
                 MapRender? mapRender = new MapRender(splat, Topology);
                 mapInfo.png = CompressAndEncode(mapRender.Render());
                 var world = worldSerialization.world;
+                if (world == null) { return null; }
                 mapInfo.worldsize = (int)world.size;
                 if (mapInfo.worldsize > 8000 || mapInfo.worldsize < 300) mapInfo.worldsize = 8000;
                 mapInfo.mapCount = world.maps.Count;
@@ -1946,9 +1803,7 @@ namespace RustRelayReceiver
             catch (Exception ex) { LogDebug($"[MAP INFO] Error: {ex.Message}"); }
             return mapInfo;
         }
-
         #endregion
-
         #region Functions
         public static void DownloadAndUnzipModels()
         {
@@ -1962,12 +1817,10 @@ namespace RustRelayReceiver
             ZipFile.ExtractToDirectory(zipPath, rootPath, overwriteFiles: true);
             File.Delete(zipPath);
         }
-
         private static void GetOrCreateWipe(string wipeId)
         {
             _entitiesByWipe.GetOrAdd(wipeId, static _ => new ConcurrentDictionary<ulong, TrackedEntity>());
         }
-
         private static bool HasAuth(HttpListenerContext context, bool index = false)
         {
             string? authCookie = null;
@@ -1990,14 +1843,12 @@ namespace RustRelayReceiver
             }
             return true;
         }
-
         private static readonly JsonSerializerOptions _jsonOptions = new()
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             PropertyNameCaseInsensitive = true
         };
-
         private static async Task SendJsonResponse(HttpListenerResponse response, int statusCode, object data)
         {
             response.StatusCode = statusCode;
@@ -2006,18 +1857,15 @@ namespace RustRelayReceiver
             response.ContentLength64 = jsonBytes.Length;
             await response.OutputStream.WriteAsync(jsonBytes, 0, jsonBytes.Length);
         }
-
         private static void PrintStatistics()
         {
             lock (_consoleLock)
             {
                 DateTime now = DateTime.UtcNow;
                 int row = 0;
-
                 MoveCursor(row++);
                 ClearLine();
                 Console.Write($"[STATS] Uptime: {GetUptimeSeconds():F0}s | WebSockets: {_webSocketClients.Count} | Packets: {Interlocked.Read(ref _totalPacketsReceived)}");
-
                 foreach (var server in _connectedServers.Values)
                 {
                     MoveCursor(row++);
@@ -2026,18 +1874,15 @@ namespace RustRelayReceiver
                     string activeStr = FormatReadableTime(now - server.lastActivity);
                     Console.Write($"[Server] ID: {server.wipeId} | Up: {connectedStr} | Active: {activeStr} | Data: {FormatBytes(server.bytesReceived)}");
                 }
-
                 for (int i = row; i < _headerHeight; i++)
                 {
                     MoveCursor(i);
                     ClearLine();
                 }
-
                 _headerHeight = row + 2;
                 MoveCursor(_headerHeight);
             }
         }
-
         public static void LogDebug(string message)
         {
 #if DEBUG
@@ -2052,17 +1897,14 @@ namespace RustRelayReceiver
             }
 #endif
         }
-
         private static void ClearLine()
         {
             Console.Write("\x1b[2K");
         }
-
         private static void MoveCursor(int row, int col = 0)
         {
             Console.Write($"\x1b[{row + 1};{col + 1}H");
         }
-
         private static string FormatReadableTime(TimeSpan ts)
         {
             if (ts.TotalDays >= 1) { return string.Format("{0}d {1}h", (int)ts.TotalDays, ts.Hours); }
@@ -2070,7 +1912,6 @@ namespace RustRelayReceiver
             if (ts.TotalMinutes >= 1) { return string.Format("{0}m {1}s", (int)ts.TotalMinutes, ts.Seconds); }
             return string.Format("{0}s", ts.Seconds);
         }
-
         public static string FormatBytes(long bytes)
         {
             string[] Suffix = { "B", "KB", "MB", "GB", "TB" };
@@ -2083,9 +1924,7 @@ namespace RustRelayReceiver
             }
             return string.Format("{0:0.#} {1}", dblSByte, Suffix[i]);
         }
-
         private static double GetUptimeSeconds() { return (Stopwatch.GetTimestamp() - _startTime) / (double)Stopwatch.Frequency; }
-
         private static void StopAll()
         {
             foreach (var kvp in _webSocketClients)
@@ -2101,7 +1940,6 @@ namespace RustRelayReceiver
             _httpListener.Stop();
             _httpListener.Close();
         }
-
         private static void CreateDirectories(string wipeid)
         {
             if (Directory.Exists(Path.Combine(DataDirectory, wipeid))) { return; }
@@ -2115,7 +1953,6 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Warning: Could not create directories: {ex.Message}"); }
         }
-
         private static void ParseArguments(string[] args)
         {
             for (int i = 0; i < args.Length; i++)
@@ -2132,12 +1969,10 @@ namespace RustRelayReceiver
                 }
             }
         }
-
         private static void TrackServerActivity(string? wipeId)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
             GetOrCreateWipe(wipeId);
-
             var server = _connectedServers.GetOrAdd(wipeId, id => new ServerInfo
             {
                 wipeId = id,
@@ -2146,11 +1981,9 @@ namespace RustRelayReceiver
             });
             server.lastActivity = DateTime.UtcNow;
         }
-
         private static void UpdateServerStats(string? wipeId, int bytesReceived)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
-
             var server = GetServerByWipeId(wipeId);
             if (server != null)
             {
@@ -2159,11 +1992,9 @@ namespace RustRelayReceiver
                 server.lastActivity = DateTime.UtcNow;
             }
         }
-
         private static void MarkServerFileReceived(string? wipeId, string fileType)
         {
             if (string.IsNullOrEmpty(wipeId)) return;
-
             var server = GetServerByWipeId(wipeId);
             if (server != null)
             {
@@ -2172,21 +2003,17 @@ namespace RustRelayReceiver
                 server.lastActivity = DateTime.UtcNow;
             }
         }
-
         private static string? GetStringFromPool(string? wipeId, uint id)
         {
             if (_globalStringPool.TryGetValue(id, out var global))
                 return global;
-
             if (wipeId != null && _wipeStringPools.TryGetValue(wipeId, out var pool))
                 if (pool.TryGetValue(id, out var value))
                     return value;
-
             LoadWipeStringToGlobalPool(wipeId);
             _globalStringPool.TryGetValue(id, out var result);
             return result;
         }
-
         private static void LoadWipeStringToGlobalPool(string? wipeId)
         {
             if (wipeId == null) return;
@@ -2210,17 +2037,15 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[StringPool] Error loading {latestFile}: {ex.Message}"); }
         }
-
         public static string CompressAndEncode(byte[]? data)
         {
             if (data == null || data.Length == 0) { return string.Empty; }
             using (var outputStream = new MemoryStream())
             {
-                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.SmallestSize, true)) { gZipStream.Write(data, 0, data.Length); }
+                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.Optimal, true)) { gZipStream.Write(data, 0, data.Length); }
                 return Convert.ToBase64String(outputStream.GetBuffer(), 0, (int)outputStream.Length);
             }
         }
-
         private static byte[]? DownsampleMap(byte[] data, int stepSize)
         {
             if (data == null || data.Length == 0) return null;
@@ -2244,7 +2069,6 @@ namespace RustRelayReceiver
             }
             return result;
         }
-
         private static string? ExtractFormName(string headers)
         {
             int nameIndex = headers.IndexOf("name=\"");
@@ -2254,7 +2078,6 @@ namespace RustRelayReceiver
                 int end = headers.IndexOf("\"", start);
                 if (end > start) { return headers[start..end]; }
             }
-
             nameIndex = headers.IndexOf("name=", StringComparison.OrdinalIgnoreCase);
             if (nameIndex >= 0)
             {
@@ -2273,7 +2096,6 @@ namespace RustRelayReceiver
             }
             return null;
         }
-
         private static string? ExtractOriginalFilename(string headers)
         {
             int nameIndex = headers.IndexOf("filename=", StringComparison.OrdinalIgnoreCase);
@@ -2294,18 +2116,15 @@ namespace RustRelayReceiver
             }
             return null;
         }
-
         private static int FindBytes(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needle, int startPos)
         {
             if (needle.Length == 0) return startPos;
             if (startPos < 0) startPos = 0;
             if (startPos >= haystack.Length) return -1;
-
             var searchSpace = haystack[startPos..];
             int idx = searchSpace.IndexOf(needle);
             return idx >= 0 ? idx + startPos : -1;
         }
-
         private static void SaveMapFileToDirectory(string wipeId, string filename, byte[] data)
         {
             try
@@ -2318,7 +2137,6 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Map file: {ex.Message}"); }
         }
-
         private static WorldSerialization? GetCachedWorldSerialization(string? wipeId)
         {
             lock (_mapCacheLock)
@@ -2342,7 +2160,6 @@ namespace RustRelayReceiver
                 return ws;
             }
         }
-
         private static string? ExtractFilename(string headers)
         {
             int nameIndex = headers.IndexOf("filename=\"");
@@ -2352,7 +2169,6 @@ namespace RustRelayReceiver
             if (end < 0) { return null; }
             return headers[start..end];
         }
-
         private static async Task SaveStringPoolToFile(string? wipeId, Dictionary<uint, string> stringPool)
         {
             if (wipeId == null) return;
@@ -2373,7 +2189,6 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed: {ex.Message}"); }
         }
-
         private static void SaveManifestToFile(string? wipeId, Dictionary<uint, string> manifest)
         {
             try
@@ -2397,7 +2212,6 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Manifest: {ex.Message}"); }
         }
-
         private static void SaveSnapshotToFile(string? wipeId, byte[] data)
         {
             try
@@ -2415,14 +2229,12 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Snapshot: {ex.Message}"); }
         }
-
         private static string SanitizeFilename(string filename)
         {
             char[] invalid = Path.GetInvalidFileNameChars();
             foreach (char c in invalid) { filename = filename.Replace(c, '_'); }
             return filename;
         }
-
         private static string EscapeJsonString(string s)
         {
             if (s == null) { return ""; }
@@ -2430,7 +2242,6 @@ namespace RustRelayReceiver
         }
     }
     #endregion
-
     #region Classes
     public static class SimpleJsonParser
     {
@@ -2455,14 +2266,12 @@ namespace RustRelayReceiver
             }
             return result;
         }
-
         private static List<string> SplitJsonObjects(string json)
         {
             var result = new List<string>();
             int depth = 0;
             int start = 0;
             bool inString = false;
-
             for (int i = 0; i < json.Length; i++)
             {
                 char c = json[i];
@@ -2482,256 +2291,52 @@ namespace RustRelayReceiver
             return result;
         }
     }
-
-    public sealed class EffectData
-    {
-        public int type;
-        public uint pooledstringid;
-        public int number;
-        public Vector3? origin;
-        public Vector3? normal;
-        public float scale;
-        public ulong entity;
-        public uint bone;
-        public ulong source;
-        public float distanceOverride;
-        public bool ignoreMaxSpawnDistance;
-        public ulong sourceEntity;
-    }
-
-    public struct BaseNetworkable
-    {
-        public NetworkableId uid;
-        public uint prefabID;
-        public uint group;
-    }
-
-    public enum Wire
-    {
-        Varint = 0,
-        Fixed64 = 1,
-        LengthDelimited = 2,
-        StartGroup = 3,
-        EndGroup = 4,
-        Fixed32 = 5
-    }
-
-    public struct Key
-    {
-        public uint Field;
-        public Wire WireType;
-        public Key(uint field, Wire wireType) { Field = field; WireType = wireType; }
-    }
-
-    public struct Entity { public BaseNetworkable? baseNetworkable; }
-
-    [Flags]
-    public enum Flags : int
-    {
-        Placeholder = 1, On = 2, OnFire = 4, Open = 8, Locked = 16, Debugging = 32,
-        Disabled = 64, Reserved1 = 128, Reserved2 = 256, Reserved3 = 512, Reserved4 = 1024,
-        Reserved5 = 2048, Broken = 4096, Busy = 8192, Reserved6 = 16384, Reserved7 = 32768,
-        Reserved8 = 65536, Reserved9 = 131072, Reserved10 = 262144, Reserved11 = 524288,
-        InUse = 1048576, Reserved12 = 2097152, Reserved13 = 4194304, Unused23 = 8388608,
-        Protected = 16777216, Transferring = 33554432, Reserved14 = 67108864, Reserved15 = 134217728,
-        Reserved16 = 268435456, Reserved17 = 536870912, Reserved18 = 1073741824,
-        Reserved19 = unchecked((int)0x80000000)
-    }
-
     public sealed class TrackedEntity
     {
         public ulong Id;
         public uint PrefabId;
         public string? PrefabName = "";
         public uint GroupId;
-        public Vector3? pos;
-        public Vector3? rot;
+        public VectorData pos;
+        public VectorData rot;
         public int Flags;
         public bool isDestroyed = false;
+        public ulong Parent = 0;
+        public string? Playername;
+        public float Health;
+
+        public string? TypeClass { get; set; }
+        public float? MaxHealth { get; set; }
+        public float? Durability { get; set; }
+        public float? MaxDurability { get; set; }
+        public int? Ammo { get; set; }
+        public int? MaxAmmo { get; set; }
+        public ulong? OwnerId { get; set; }
+        public string? OwnerName { get; set; }
+        public Dictionary<string, object>? Extra { get; set; } = new();
 
         public TrackedEntity() { }
-
         public void UpdatePosition(float px, float py, float pz, float rx, float ry, float rz)
         {
-            pos = new Vector3(px, py, pz);
-            rot = new Vector3(rx, ry, rz);
+            pos = new VectorData(px, py, pz);
+            rot = new VectorData(rx, ry, rz);
         }
-
         public void UpdateFlags(int flags)
         {
             Flags = flags;
         }
     }
-
     public sealed class TrackedEffect
     {
         public ulong Id;
         public string? PrefabName = "";
-        public Vector3? pos;
-
+        public VectorData pos;
         public TrackedEffect() { }
-
         public void UpdatePosition(float px, float py, float pz)
         {
-            pos = new Vector3(px, py, pz);
+            pos = new VectorData(px, py, pz);
         }
     }
-
-    public static class ProtoVector3
-    {
-        public static Vector3 Deserialize(byte[] data) => Deserialize(data.AsSpan());
-
-        public static Vector3 Deserialize(ReadOnlySpan<byte> data)
-        {
-            float x = 0, y = 0, z = 0;
-            int offset = 0;
-
-            while (offset < data.Length)
-            {
-                uint tag = ReadVarUInt32(data, ref offset);
-                uint field = tag >> 3;
-                uint wire = tag & 7;
-
-                switch (field)
-                {
-                    case 1: x = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
-                    case 2: y = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
-                    case 3: z = BinaryPrimitives.ReadSingleLittleEndian(data[offset..]); offset += 4; break;
-                    default: SkipWire(data, ref offset, wire); break;
-                }
-            }
-            return new Vector3(x, y, z);
-        }
-
-        private static uint ReadVarUInt32(ReadOnlySpan<byte> data, ref int index)
-        {
-            uint result = 0;
-            int shift = 0;
-            while (true)
-            {
-                byte b = data[index++];
-                result |= (uint)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) return result;
-                shift += 7;
-            }
-        }
-
-        private static void SkipWire(ReadOnlySpan<byte> data, ref int index, uint wire)
-        {
-            switch (wire)
-            {
-                case 0: while ((data[index++] & 0x80) != 0) { } break;
-                case 1: index += 8; break;
-                case 2: index += (int)ReadVarUInt32(data, ref index); break;
-                case 5: index += 4; break;
-                default: throw new Exception("Bad wire type");
-            }
-        }
-    }
-
-    public ref struct ProtoReader
-    {
-        private readonly ReadOnlySpan<byte> _buffer;
-        private int _pos;
-
-        public ProtoReader(ReadOnlySpan<byte> buffer) { _buffer = buffer; _pos = 0; }
-
-        public readonly bool EOF => _pos >= _buffer.Length;
-
-        public uint ReadTag() => EOF ? 0 : ReadVarUInt32();
-
-        public uint ReadVarUInt32()
-        {
-            uint result = 0;
-            int shift = 0;
-            while (true)
-            {
-                byte b = _buffer[_pos++];
-                result |= (uint)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) break;
-                shift += 7;
-            }
-            return result;
-        }
-
-        public ulong ReadVarUInt64()
-        {
-            ulong result = 0;
-            int shift = 0;
-            while (true)
-            {
-                byte b = _buffer[_pos++];
-                result |= (ulong)(b & 0x7F) << shift;
-                if ((b & 0x80) == 0) break;
-                shift += 7;
-            }
-            return result;
-        }
-
-        public float ReadFixed32() => BinaryPrimitives.ReadSingleLittleEndian(_buffer[_pos..]);
-
-        public byte[] ReadBytes()
-        {
-            int length = (int)ReadVarUInt32();
-            var data = new byte[length];
-            _buffer.Slice(_pos, length).CopyTo(data);
-            _pos += length;
-            return data;
-        }
-
-        public void Skip(uint wireType)
-        {
-            switch (wireType)
-            {
-                case 0: ReadVarUInt64(); break;
-                case 1: _pos += 8; break;
-                case 2: _pos += (int)ReadVarUInt32(); break;
-                case 5: _pos += 4; break;
-                default: throw new InvalidOperationException($"Unknown wire type: {wireType}");
-            }
-        }
-    }
-
-    public static class ProtoPacketProcessor
-    {
-        public enum MessageType : byte
-        {
-            First,
-            Welcome,
-            Auth,
-            Approved,
-            Ready,
-            Entities,
-            EntityDestroy,
-            GroupChange,
-            GroupDestroy,
-            RPCMessage,
-            EntityPosition,
-            ConsoleMessage,
-            ConsoleCommand,
-            Effect,
-            DisconnectReason,
-            Tick,
-            Message,
-            RequestUserInformation,
-            GiveUserInformation,
-            GroupEnter,
-            GroupLeave,
-            VoiceData,
-            EAC,
-            EntityFlags,
-            World,
-            ConsoleReplicatedVars,
-            QueueUpdate,
-            SyncVar,
-            PackedSyncVar,
-            Last = 28,
-            Count,
-            DemoDisconnection = 50,
-            DemoTransientEntities
-        }
-    }
-
     public class ServerInfo
     {
         public string? wipeId { get; set; }
@@ -2741,7 +2346,6 @@ namespace RustRelayReceiver
         public long bytesReceived { get; set; }
         public List<string> receivedFiles { get; set; } = new();
     }
-
     public class MapInfo
     {
         public int worldsize { get; set; }
@@ -2757,9 +2361,7 @@ namespace RustRelayReceiver
         public long timestamp { get; set; }
         public string? png { get; set; }
     }
-
     #endregion
-
     #region Rust.World
     public class WorldSerialization
     {
@@ -2770,35 +2372,20 @@ namespace RustRelayReceiver
             Version = 10U;
             Timestamp = 0L;
         }
+        public WorldData? world;
         public MapData? GetMap(string name)
         {
-            for (int i = 0; i < world.maps.Count; i++)
+            if (this.world == null) { return null; }
+            for (int i = 0; i < this.world.maps.Count; i++)
             {
-                if (world.maps[i].name == name) { return world.maps[i]; }
+                if (this.world.maps[i].name == name)
+                {
+                    return this.world.maps[i];
+                }
             }
             return null;
         }
-
         public List<MapData> GetCustomMonuments() { return world?.maps?.Where(x => x?.name != null && (x.name.StartsWith("CustomMonument_") || x.name.StartsWith(":"))).ToList() ?? new List<MapData>(); }
-
-        public void AddMap(string name, byte[] data)
-        {
-            MapData mapData = new();
-            mapData.name = name;
-            mapData.data = data;
-            world.maps.Add(mapData);
-        }
-
-        public IEnumerable<PrefabData> GetPrefabs(string category) { return world.prefabs.Where((PrefabData p) => p.category == category); }
-
-        public IEnumerable<PathData> GetPaths(string name) { return world.paths.Where((PathData p) => p.name.Contains(name)); }
-
-        public PathData? GetPath(string name)
-        {
-            for (int i = 0; i < world.paths.Count; i++) { if (world.paths[i].name == name) { return world.paths[i]; } }
-            return null;
-        }
-
         public void Load(string fileName)
         {
             try
@@ -2817,21 +2404,26 @@ namespace RustRelayReceiver
                         {
                             Timestamp = binaryReader.ReadInt64();
                         }
-                        using (LZ4Stream lz4Stream = new LZ4Stream(fileStream, LZ4StreamMode.Decompress, LZ4StreamFlags.None, 1048576))
+                        using (var lz4Stream = new LZ4Stream(fileStream, LZ4StreamMode.Decompress, LZ4StreamFlags.None, 1048576))
                         {
                             try
                             {
-                                using (MemoryStream memoryStream = new MemoryStream())
+                                using (var bufferStream = new BufferStream().Initialize())
                                 {
-                                    lz4Stream.CopyTo(memoryStream);
-                                    memoryStream.Position = 0L;
-                                    world = WorldData.Deserialize(memoryStream);
+                                    Span<byte> temp = stackalloc byte[64 * 1024];
+                                    int read;
+                                    while ((read = lz4Stream.Read(temp)) > 0)
+                                    {
+                                        var range = bufferStream.GetRange(read);
+                                        temp.Slice(0, read).CopyTo(range.GetSpan());
+                                    }
+                                    bufferStream.Position = 0;
+                                    world = WorldData.Deserialize(bufferStream);
                                 }
                             }
                             catch
                             {
-                                Program.LogDebug("Failed to deserialize map. Falling back to ProtoBuf.Deserialize");
-                                world = OldSerialization.Deserialize(lz4Stream);
+                                Program.LogDebug("Failed to deserialize map.");
                             }
                         }
                     }
@@ -2839,274 +2431,32 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { Program.LogDebug(ex.Message); }
         }
-
-        public WorldData world = new WorldData();
-
-        [ProtoContract]
-        [Serializable]
-        public class ExportData
-        {
-            [ProtoMember(1)]
-            public uint size = 4000U;
-
-            [ProtoMember(2)]
-            public string? name;
-
-            [ProtoMember(3)]
-            public byte[]? data;
-
-            [ProtoMember(4)]
-            public int? res;
-        }
-    }
-
-    namespace ProtoBuf
-    {
-        [ProtoContract]
-        [Serializable]
-        public class MapData
-        {
-            [ProtoMember(1)]
-            public string? name;
-
-            [ProtoMember(2)]
-            public byte[]? data;
-        }
-
-        [ProtoContract]
-        [Serializable]
-        public class PathData
-        {
-            public PathData() { }
-
-            public PathData(PathData pathData)
-            {
-                name = pathData.name;
-                spline = pathData.spline;
-                start = pathData.start;
-                end = pathData.end;
-                innerPadding = pathData.innerPadding;
-                outerPadding = pathData.outerPadding;
-                innerFade = pathData.innerFade;
-                outerFade = pathData.outerFade;
-                randomScale = pathData.randomScale;
-                width = pathData.width;
-                meshOffset = pathData.meshOffset;
-                terrainOffset = pathData.terrainOffset;
-                splat = pathData.splat;
-                topology = pathData.topology;
-                nodes = new List<VectorData>();
-            }
-
-            [ProtoMember(1)]
-            public string name = string.Empty;
-
-            [ProtoMember(2)]
-            public bool spline;
-
-            [ProtoMember(3)]
-            public bool start;
-
-            [ProtoMember(4)]
-            public bool end;
-
-            [ProtoMember(5)]
-            public float width;
-
-            [ProtoMember(6)]
-            public float innerPadding;
-
-            [ProtoMember(7)]
-            public float outerPadding;
-
-            [ProtoMember(8)]
-            public float innerFade;
-
-            [ProtoMember(9)]
-            public float outerFade;
-
-            [ProtoMember(10)]
-            public float randomScale;
-
-            [ProtoMember(11)]
-            public float meshOffset;
-
-            [ProtoMember(12)]
-            public float terrainOffset;
-
-            [ProtoMember(13)]
-            public int splat;
-
-            [ProtoMember(14)]
-            public int topology;
-
-            [ProtoMember(15)]
-            public List<VectorData> nodes = new();
-
-            [ProtoMember(16)]
-            public int hierarchy;
-        }
-
-        [ProtoContract]
-        [Serializable]
-        public class PrefabData
-        {
-            [ProtoMember(1)]
-            public string? category;
-
-            [ProtoMember(2)]
-            public uint id;
-
-            [ProtoMember(3)]
-            public VectorData position;
-
-            [ProtoMember(4)]
-            public VectorData rotation;
-
-            [ProtoMember(5)]
-            public VectorData scale;
-        }
-
-        public struct NetworkableId : IEquatable<NetworkableId>
-        {
-            public ulong Value { get; set; }
-            public readonly bool IsValid => Value > 0;
-            public NetworkableId(ulong value) { Value = value; }
-            public readonly bool Equals(NetworkableId other) => Value == other.Value;
-        }
-
-        public class Vector3
-        {
-            public float X { get; set; }
-            public float Y { get; set; }
-            public float Z { get; set; }
-
-            public Vector3(float x, float y, float z)
-            {
-                X = x;
-                Y = y;
-                Z = z;
-            }
-            public static Vector3 Zero => new(0, 0, 0);
-            public float LengthSquared => X * X + Y * Y + Z * Z;
-            public float Length => MathF.Sqrt(LengthSquared);
-            public static Vector3 operator +(Vector3 a, Vector3 b) => new(a.X + b.X, a.Y + b.Y, a.Z + b.Z);
-            public static Vector3 operator -(Vector3 a, Vector3 b) => new(a.X - b.X, a.Y - b.Y, a.Z - b.Z);
-            public static Vector3 operator *(Vector3 a, float scalar) => new(a.X * scalar, a.Y * scalar, a.Z * scalar);
-            public static Vector3 operator /(Vector3 a, float scalar) => new(a.X / scalar, a.Y / scalar, a.Z / scalar);
-            public override string ToString() => $"({X:F2}, {Y:F2}, {Z:F2})";
-        }
-
-        public class Quaternion
-        {
-            public float x;
-            public float y;
-            public float z;
-            public float w;
-
-            public Quaternion(float x, float y, float z, float w)
-            {
-                this.x = x;
-                this.y = y;
-                this.z = z;
-                this.w = w;
-            }
-        }
-
-        [ProtoContract]
-        [Serializable]
-        public struct VectorData
-        {
-            public VectorData(float x, float y, float z)
-            {
-                this.x = x;
-                this.y = y;
-                this.z = z;
-            }
-
-            public static implicit operator VectorData(Vector3 v)
-            {
-                return new VectorData(v.X, v.Y, v.Z);
-            }
-
-            public static implicit operator VectorData(Quaternion q)
-            {
-                return q;
-            }
-
-            public static implicit operator Vector3(VectorData v)
-            {
-                return new Vector3(v.x, v.y, v.z);
-            }
-
-            [ProtoMember(1)]
-            public float x { get; set; }
-
-            [ProtoMember(2)]
-            public float y { get; set; }
-
-            [ProtoMember(3)]
-            public float z { get; set; }
-
-        }
-
-        [ProtoContract]
-        [Serializable]
-        public class WorldData
-        {
-            public static void Serialize(Stream stream, WorldData data) { Serializer.Serialize<WorldData>(stream, data); }
-
-            public static WorldData Deserialize(Stream stream) { return Serializer.Deserialize<WorldData>(stream); }
-
-            [ProtoMember(1)]
-            public uint size = 4000U;
-
-            [ProtoMember(2)]
-            public List<MapData> maps = new();
-
-            [ProtoMember(3)]
-            public List<PrefabData> prefabs = new();
-
-            [ProtoMember(4)]
-            public List<PathData> paths = new();
-        }
-
-        public class OldSerialization
-        {
-            public static WorldData Deserialize(Stream stream) { return Serializer.Deserialize<WorldData>(stream); }
-        }
     }
     #endregion
-
     #region Create Map Image
     public class MapRender
     {
         public int splatres;
         public byte[] Splat;
         public int[] Topology;
-
         public MapRender(byte[] splat, int[] topology)
         {
             splatres = (int)Math.Sqrt(splat.Length / 8);
             Splat = splat;
             Topology = topology;
         }
-
         public static Array2D<Color> output;
-
         public struct Array2D<T>
         {
             private T[] _items;
             private int _width;
             private int _height;
-
             public Array2D(T[] items, int width, int height)
             {
                 _items = items;
                 _width = width;
                 _height = height;
             }
-
             public ref T this[int x, int y]
             {
                 get
@@ -3117,34 +2467,26 @@ namespace RustRelayReceiver
                 }
             }
         }
-
         public int GetTopology(int x, int z) { return Topology[z * splatres + x]; }
-
         public static float Byte2Float(int b) => b / 255f;
-
         private static Dictionary<int, int> type2index = new Dictionary<int, int> { { 8, 3 }, { 16, 4 }, { 4, 2 }, { 1, 0 }, { 32, 5 }, { 64, 6 }, { 2, 1 }, { 128, 7 } };
-
         public static int TypeToIndex(int id) => type2index[id];
         public static int IndexToType(int idx) => 1 << idx;
-
         public float GetSplat(int x, int z, int mask)
         {
             if (mask > 0 && (mask & (mask - 1)) == 0)
                 return Byte2Float(Splat[(TypeToIndex(mask) * splatres + z) * splatres + x]);
-
             int sum = 0;
             for (int i = 0; i < 8; i++)
                 if ((IndexToType(i) & mask) != 0)
                     sum += Splat[(i * splatres + z) * splatres + x];
             return Math.Min(Byte2Float(sum), 1f);
         }
-
         public readonly struct Vec4
         {
             public readonly float x, y, z, w;
             public Vec4(float x, float y, float z, float w = 1f) { this.x = x; this.y = y; this.z = z; this.w = w; }
             public static Vec4 operator *(Vec4 v, float f) => new Vec4(v.x * f, v.y * f, v.z * f, v.w * f);
-
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             public static Vec4 Lerp(Vec4 a, Vec4 b, float t) => new Vec4(
                 a.x + (b.x - a.x) * t,
@@ -3153,7 +2495,6 @@ namespace RustRelayReceiver
                 a.w + (b.w - a.w) * t
             );
         }
-
         public class Config
         {
             public Vec4 StartColor = new Vec4(0.28627452f, 0.27058825f, 0.24705884f, 1f);
@@ -3167,7 +2508,6 @@ namespace RustRelayReceiver
             public Vec4 SnowColor = new Vec4(0.86274517f, 0.9294118f, 0.94117653f, 1f);
             public Vec4 PebbleColor = new Vec4(0.13725491f, 0.2784314f, 0.2761563f, 1f);
         }
-
         [Flags]
         public enum MapEnum
         {
@@ -3175,14 +2515,12 @@ namespace RustRelayReceiver
             Lake = 65536,
             River = 16384,
         }
-
         public byte[]? Render()
         {
             if (Topology == null || Splat == null) return null;
             var config = new Config();
             Color[] array = new Color[splatres * splatres];
             output = new Array2D<Color>(array, splatres, splatres);
-
             Parallel.For(0, splatres, x =>
             {
                 float[] splatValues = new float[8];
@@ -3191,7 +2529,6 @@ namespace RustRelayReceiver
                     Vec4 vector = config.StartColor;
                     MapEnum topology = (MapEnum)GetTopology(x, z);
                     bool ocean = (topology & MapEnum.Ocean) != 0;
-
                     if (ocean)
                         vector = config.OffShoreColor;
                     else if ((topology & (MapEnum.Lake | MapEnum.River)) != 0)
@@ -3206,7 +2543,6 @@ namespace RustRelayReceiver
                         splatValues[5] = GetSplat(x, z, 32);
                         splatValues[6] = GetSplat(x, z, 4);
                         splatValues[7] = GetSplat(x, z, 2);
-
                         vector = Vec4.Lerp(vector, config.GravelColor, splatValues[0] * config.GravelColor.w);
                         vector = Vec4.Lerp(vector, config.PebbleColor, splatValues[1] * config.PebbleColor.w);
                         vector = Vec4.Lerp(vector, config.RockColor, splatValues[2] * config.RockColor.w);
@@ -3216,7 +2552,6 @@ namespace RustRelayReceiver
                         vector = Vec4.Lerp(vector, config.SandColor, splatValues[6] * config.SandColor.w);
                         vector = Vec4.Lerp(vector, config.SnowColor, splatValues[7] * config.SnowColor.w);
                     }
-
                     vector *= 1.05f;
                     array[z * splatres + x] = Color.FromArgb(
                         255,
@@ -3227,9 +2562,7 @@ namespace RustRelayReceiver
             });
             return EncodeBmp(array, splatres, splatres);
         }
-
         private static byte ClampToByte(float v) => (byte)Math.Max(0, Math.Min(255, (int)v));
-
         private byte[] EncodeBmp(Color[] pixels, int width, int height)
         {
             int maxDim = Math.Max(width, height);
@@ -3292,11 +2625,9 @@ namespace RustRelayReceiver
                 for (int i = 0; i < rowSize - newWidth * 3; i++)
                     bw.Write((byte)0);
             }
-
             return buffer;
         }
     }
-
     public enum KnownColor
     {
         ActiveBorder = 1,
@@ -3475,293 +2806,150 @@ namespace RustRelayReceiver
         MenuBar,
         MenuHighlight
     }
-
     public readonly struct Color : IEquatable<Color>
     {
         public static readonly Color Empty;
-
         public static Color Transparent => new Color(KnownColor.Transparent);
-
         public static Color AliceBlue => new Color(KnownColor.AliceBlue);
-
         public static Color AntiqueWhite => new Color(KnownColor.AntiqueWhite);
-
         public static Color Aqua => new Color(KnownColor.Aqua);
-
         public static Color Aquamarine => new Color(KnownColor.Aquamarine);
-
         public static Color Azure => new Color(KnownColor.Azure);
-
         public static Color Beige => new Color(KnownColor.Beige);
-
         public static Color Bisque => new Color(KnownColor.Bisque);
-
         public static Color Black => new Color(KnownColor.Black);
-
         public static Color BlanchedAlmond => new Color(KnownColor.BlanchedAlmond);
-
         public static Color Blue => new Color(KnownColor.Blue);
-
         public static Color BlueViolet => new Color(KnownColor.BlueViolet);
-
         public static Color Brown => new Color(KnownColor.Brown);
-
         public static Color BurlyWood => new Color(KnownColor.BurlyWood);
-
         public static Color CadetBlue => new Color(KnownColor.CadetBlue);
-
         public static Color Chartreuse => new Color(KnownColor.Chartreuse);
-
         public static Color Chocolate => new Color(KnownColor.Chocolate);
-
         public static Color Coral => new Color(KnownColor.Coral);
-
         public static Color CornflowerBlue => new Color(KnownColor.CornflowerBlue);
-
         public static Color Cornsilk => new Color(KnownColor.Cornsilk);
-
         public static Color Crimson => new Color(KnownColor.Crimson);
-
         public static Color Cyan => new Color(KnownColor.Cyan);
-
         public static Color DarkBlue => new Color(KnownColor.DarkBlue);
-
         public static Color DarkCyan => new Color(KnownColor.DarkCyan);
-
         public static Color DarkGoldenrod => new Color(KnownColor.DarkGoldenrod);
-
         public static Color DarkGray => new Color(KnownColor.DarkGray);
-
         public static Color DarkGreen => new Color(KnownColor.DarkGreen);
-
         public static Color DarkKhaki => new Color(KnownColor.DarkKhaki);
-
         public static Color DarkMagenta => new Color(KnownColor.DarkMagenta);
-
         public static Color DarkOliveGreen => new Color(KnownColor.DarkOliveGreen);
-
         public static Color DarkOrange => new Color(KnownColor.DarkOrange);
-
         public static Color DarkOrchid => new Color(KnownColor.DarkOrchid);
-
         public static Color DarkRed => new Color(KnownColor.DarkRed);
-
         public static Color DarkSalmon => new Color(KnownColor.DarkSalmon);
-
         public static Color DarkSeaGreen => new Color(KnownColor.DarkSeaGreen);
-
         public static Color DarkSlateBlue => new Color(KnownColor.DarkSlateBlue);
-
         public static Color DarkSlateGray => new Color(KnownColor.DarkSlateGray);
-
         public static Color DarkTurquoise => new Color(KnownColor.DarkTurquoise);
-
         public static Color DarkViolet => new Color(KnownColor.DarkViolet);
-
         public static Color DeepPink => new Color(KnownColor.DeepPink);
-
         public static Color DeepSkyBlue => new Color(KnownColor.DeepSkyBlue);
-
         public static Color DimGray => new Color(KnownColor.DimGray);
-
         public static Color DodgerBlue => new Color(KnownColor.DodgerBlue);
-
         public static Color Firebrick => new Color(KnownColor.Firebrick);
-
         public static Color FloralWhite => new Color(KnownColor.FloralWhite);
-
         public static Color ForestGreen => new Color(KnownColor.ForestGreen);
-
         public static Color Fuchsia => new Color(KnownColor.Fuchsia);
-
         public static Color Gainsboro => new Color(KnownColor.Gainsboro);
-
         public static Color GhostWhite => new Color(KnownColor.GhostWhite);
-
         public static Color Gold => new Color(KnownColor.Gold);
-
         public static Color Goldenrod => new Color(KnownColor.Goldenrod);
-
         public static Color Gray => new Color(KnownColor.Gray);
-
         public static Color Green => new Color(KnownColor.Green);
-
         public static Color GreenYellow => new Color(KnownColor.GreenYellow);
-
         public static Color Honeydew => new Color(KnownColor.Honeydew);
-
         public static Color HotPink => new Color(KnownColor.HotPink);
-
         public static Color IndianRed => new Color(KnownColor.IndianRed);
-
         public static Color Indigo => new Color(KnownColor.Indigo);
-
         public static Color Ivory => new Color(KnownColor.Ivory);
-
         public static Color Khaki => new Color(KnownColor.Khaki);
-
         public static Color Lavender => new Color(KnownColor.Lavender);
-
         public static Color LavenderBlush => new Color(KnownColor.LavenderBlush);
-
         public static Color LawnGreen => new Color(KnownColor.LawnGreen);
-
         public static Color LemonChiffon => new Color(KnownColor.LemonChiffon);
-
         public static Color LightBlue => new Color(KnownColor.LightBlue);
-
         public static Color LightCoral => new Color(KnownColor.LightCoral);
-
         public static Color LightCyan => new Color(KnownColor.LightCyan);
-
         public static Color LightGoldenrodYellow => new Color(KnownColor.LightGoldenrodYellow);
-
         public static Color LightGreen => new Color(KnownColor.LightGreen);
-
         public static Color LightGray => new Color(KnownColor.LightGray);
-
         public static Color LightPink => new Color(KnownColor.LightPink);
-
         public static Color LightSalmon => new Color(KnownColor.LightSalmon);
-
         public static Color LightSeaGreen => new Color(KnownColor.LightSeaGreen);
-
         public static Color LightSkyBlue => new Color(KnownColor.LightSkyBlue);
-
         public static Color LightSlateGray => new Color(KnownColor.LightSlateGray);
-
         public static Color LightSteelBlue => new Color(KnownColor.LightSteelBlue);
-
         public static Color LightYellow => new Color(KnownColor.LightYellow);
-
         public static Color Lime => new Color(KnownColor.Lime);
-
         public static Color LimeGreen => new Color(KnownColor.LimeGreen);
-
         public static Color Linen => new Color(KnownColor.Linen);
-
         public static Color Magenta => new Color(KnownColor.Magenta);
-
         public static Color Maroon => new Color(KnownColor.Maroon);
-
         public static Color MediumAquamarine => new Color(KnownColor.MediumAquamarine);
-
         public static Color MediumBlue => new Color(KnownColor.MediumBlue);
-
         public static Color MediumOrchid => new Color(KnownColor.MediumOrchid);
-
         public static Color MediumPurple => new Color(KnownColor.MediumPurple);
-
         public static Color MediumSeaGreen => new Color(KnownColor.MediumSeaGreen);
-
         public static Color MediumSlateBlue => new Color(KnownColor.MediumSlateBlue);
-
         public static Color MediumSpringGreen => new Color(KnownColor.MediumSpringGreen);
-
         public static Color MediumTurquoise => new Color(KnownColor.MediumTurquoise);
-
         public static Color MediumVioletRed => new Color(KnownColor.MediumVioletRed);
-
         public static Color MidnightBlue => new Color(KnownColor.MidnightBlue);
-
         public static Color MintCream => new Color(KnownColor.MintCream);
-
         public static Color MistyRose => new Color(KnownColor.MistyRose);
-
         public static Color Moccasin => new Color(KnownColor.Moccasin);
-
         public static Color NavajoWhite => new Color(KnownColor.NavajoWhite);
-
         public static Color Navy => new Color(KnownColor.Navy);
-
         public static Color OldLace => new Color(KnownColor.OldLace);
-
         public static Color Olive => new Color(KnownColor.Olive);
-
         public static Color OliveDrab => new Color(KnownColor.OliveDrab);
-
         public static Color Orange => new Color(KnownColor.Orange);
-
         public static Color OrangeRed => new Color(KnownColor.OrangeRed);
-
         public static Color Orchid => new Color(KnownColor.Orchid);
-
         public static Color PaleGoldenrod => new Color(KnownColor.PaleGoldenrod);
-
         public static Color PaleGreen => new Color(KnownColor.PaleGreen);
-
         public static Color PaleTurquoise => new Color(KnownColor.PaleTurquoise);
-
         public static Color PaleVioletRed => new Color(KnownColor.PaleVioletRed);
-
         public static Color PapayaWhip => new Color(KnownColor.PapayaWhip);
-
         public static Color PeachPuff => new Color(KnownColor.PeachPuff);
-
         public static Color Peru => new Color(KnownColor.Peru);
-
         public static Color Pink => new Color(KnownColor.Pink);
-
         public static Color Plum => new Color(KnownColor.Plum);
-
         public static Color PowderBlue => new Color(KnownColor.PowderBlue);
-
         public static Color Purple => new Color(KnownColor.Purple);
-
         public static Color RebeccaPurple => new Color(KnownColor.RebeccaPurple);
-
         public static Color Red => new Color(KnownColor.Red);
-
         public static Color RosyBrown => new Color(KnownColor.RosyBrown);
-
         public static Color RoyalBlue => new Color(KnownColor.RoyalBlue);
-
         public static Color SaddleBrown => new Color(KnownColor.SaddleBrown);
-
         public static Color Salmon => new Color(KnownColor.Salmon);
-
         public static Color SandyBrown => new Color(KnownColor.SandyBrown);
-
         public static Color SeaGreen => new Color(KnownColor.SeaGreen);
-
         public static Color SeaShell => new Color(KnownColor.SeaShell);
-
         public static Color Sienna => new Color(KnownColor.Sienna);
-
         public static Color Silver => new Color(KnownColor.Silver);
-
         public static Color SkyBlue => new Color(KnownColor.SkyBlue);
-
         public static Color SlateBlue => new Color(KnownColor.SlateBlue);
-
         public static Color SlateGray => new Color(KnownColor.SlateGray);
-
         public static Color Snow => new Color(KnownColor.Snow);
-
         public static Color SpringGreen => new Color(KnownColor.SpringGreen);
-
         public static Color SteelBlue => new Color(KnownColor.SteelBlue);
-
         public static Color Tan => new Color(KnownColor.Tan);
-
         public static Color Teal => new Color(KnownColor.Teal);
-
         public static Color Thistle => new Color(KnownColor.Thistle);
-
         public static Color Tomato => new Color(KnownColor.Tomato);
-
         public static Color Turquoise => new Color(KnownColor.Turquoise);
-
         public static Color Violet => new Color(KnownColor.Violet);
-
         public static Color Wheat => new Color(KnownColor.Wheat);
-
         public static Color White => new Color(KnownColor.White);
-
         public static Color WhiteSmoke => new Color(KnownColor.WhiteSmoke);
-
         public static Color Yellow => new Color(KnownColor.Yellow);
-
         public static Color YellowGreen => new Color(KnownColor.YellowGreen);
         private const short StateKnownColorValid = 0x0001;
         private const short StateARGBValueValid = 0x0002;
@@ -3780,7 +2968,6 @@ namespace RustRelayReceiver
         private readonly long value;
         private readonly short knownColor;
         private readonly short state;
-
         internal Color(KnownColor knownColor)
         {
             value = 0;
@@ -3788,7 +2975,6 @@ namespace RustRelayReceiver
             name = null;
             this.knownColor = unchecked((short)knownColor);
         }
-
         private Color(long value, short state, string? name, KnownColor knownColor)
         {
             this.value = value;
@@ -3796,29 +2982,19 @@ namespace RustRelayReceiver
             this.name = name;
             this.knownColor = unchecked((short)knownColor);
         }
-
         public byte R => unchecked((byte)(Value >> ARGBRedShift));
-
         public byte G => unchecked((byte)(Value >> ARGBGreenShift));
-
         public byte B => unchecked((byte)(Value >> ARGBBlueShift));
-
         public byte A => unchecked((byte)(Value >> ARGBAlphaShift));
-
         public bool IsKnownColor => (state & StateKnownColorValid) != 0;
-
         public bool IsEmpty => state == 0;
-
         public bool IsNamedColor => ((state & StateNameValid) != 0) || IsKnownColor;
-
         public bool IsSystemColor => IsKnownColor && IsKnownColorSystem((KnownColor)knownColor);
-
         internal static bool IsKnownColorSystem(KnownColor knownColor)
         {
             var color = Color.FromKnownColor(knownColor);
             return color.IsSystemColor;
         }
-
         public string Name
         {
             get
@@ -3837,7 +3013,6 @@ namespace RustRelayReceiver
                 return value.ToString("x");
             }
         }
-
         private long Value
         {
             get
@@ -3847,24 +3022,19 @@ namespace RustRelayReceiver
                 return NotDefinedValue;
             }
         }
-
         private static void CheckByte(int value)
         {
             static void ThrowOutOfByteRange() => throw new ArgumentException();
             if (unchecked((uint)value) > byte.MaxValue) { ThrowOutOfByteRange(); }
         }
-
         private static Color FromArgb(uint argb) => new Color(argb, StateARGBValueValid, null, (KnownColor)0);
-
         public static Color FromArgb(int argb) => FromArgb(unchecked((uint)argb));
-
         public static Color FromArgb(int alpha, int red, int green, int blue)
         {
             CheckByte(alpha);
             CheckByte(red);
             CheckByte(green);
             CheckByte(blue);
-
             return FromArgb(
                 (uint)alpha << ARGBAlphaShift |
                 (uint)red << ARGBRedShift |
@@ -3872,27 +3042,21 @@ namespace RustRelayReceiver
                 (uint)blue << ARGBBlueShift
             );
         }
-
         public static Color FromArgb(int alpha, Color baseColor)
         {
             CheckByte(alpha);
-
             return FromArgb(
                 (uint)alpha << ARGBAlphaShift |
                 (uint)baseColor.Value & ~ARGBAlphaMask
             );
         }
-
         public static Color FromArgb(int red, int green, int blue) => FromArgb(byte.MaxValue, red, green, blue);
-
         public static Color FromKnownColor(KnownColor color) =>
             color <= 0 || color > KnownColor.RebeccaPurple ? FromName(color.ToString()) : new Color(color);
-
         public static Color FromName(string name)
         {
             return new Color(NotDefinedValue, StateNameValid, name, (KnownColor)0);
         }
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void GetRgbValues(out int r, out int g, out int b)
         {
@@ -3901,7 +3065,6 @@ namespace RustRelayReceiver
             g = (int)(value & ARGBGreenMask) >> ARGBGreenShift;
             b = (int)(value & ARGBBlueMask) >> ARGBBlueShift;
         }
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void MinMaxRgb(out int min, out int max, int r, int g, int b)
         {
@@ -3924,87 +3087,64 @@ namespace RustRelayReceiver
                 min = b;
             }
         }
-
         public float GetBrightness()
         {
             GetRgbValues(out int r, out int g, out int b);
             MinMaxRgb(out int min, out int max, r, g, b);
             return (max + min) / (byte.MaxValue * 2f);
         }
-
         public float GetHue()
         {
             GetRgbValues(out int r, out int g, out int b);
-
             if (r == g && g == b)
                 return 0f;
-
             MinMaxRgb(out int min, out int max, r, g, b);
-
             float delta = max - min;
             float hue;
-
             if (r == max)
                 hue = (g - b) / delta;
             else if (g == max)
                 hue = (b - r) / delta + 2f;
             else
                 hue = (r - g) / delta + 4f;
-
             hue *= 60f;
             if (hue < 0f)
                 hue += 360f;
-
             return hue;
         }
-
         public float GetSaturation()
         {
             GetRgbValues(out int r, out int g, out int b);
-
             if (r == g && g == b)
                 return 0f;
-
             MinMaxRgb(out int min, out int max, r, g, b);
-
             int div = max + min;
             if (div > byte.MaxValue)
                 div = byte.MaxValue * 2 - max - min;
-
             return (max - min) / (float)div;
         }
-
         public int ToArgb() => unchecked((int)Value);
-
         public KnownColor ToKnownColor() => (KnownColor)knownColor;
-
         public override string ToString() =>
             IsNamedColor ? $"{nameof(Color)} [{Name}]" :
             (state & StateValueMask) != 0 ? $"{nameof(Color)} [A={A}, R={R}, G={G}, B={B}]" :
             $"{nameof(Color)} [Empty]";
-
         public static bool operator ==(Color left, Color right) =>
             left.value == right.value
                 && left.state == right.state
                 && left.knownColor == right.knownColor
                 && left.name == right.name;
-
         public static bool operator !=(Color left, Color right) => !(left == right);
-
         public override bool Equals([NotNullWhen(true)] object? obj) => obj is Color other && Equals(other);
-
         public bool Equals(Color other) => this == other;
-
         public override int GetHashCode()
         {
             if (name != null && !IsKnownColor)
                 return name.GetHashCode();
-
             return HashCode.Combine(value.GetHashCode(), state.GetHashCode(), knownColor.GetHashCode());
         }
     }
     #endregion
-
     #region HTML Pages
     public static class HtmlStyles
     {
@@ -4020,7 +3160,6 @@ namespace RustRelayReceiver
         public const string Success = "#64ff64";
         public const string Warning = "#ffc107";
         public const string BorderDefault = "#333";
-
         public static string GetBaseStyles() => @"
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -4269,7 +3408,6 @@ p { color: " + TextSecondary + @"; margin-bottom: 12px; font-size: 13px; }
     .mobile-only { display: none !important; }
 }
 ";
-
         public static string Get3DViewerStyles() => @"
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body {
@@ -4420,12 +3558,10 @@ transition: all 0.2s ease;
 }
 ";
     }
-
     public static class HtmlCache
     {
         private static readonly Dictionary<string, byte[]> _cache = new();
         private static readonly object _lock = new();
-
         public static void Clear()
         {
             lock (_lock)
@@ -4433,7 +3569,6 @@ transition: all 0.2s ease;
                 _cache.Clear();
             }
         }
-
         public static byte[]? Get(string key)
         {
             lock (_lock)
@@ -4441,7 +3576,6 @@ transition: all 0.2s ease;
                 return _cache.TryGetValue(key, out var cached) ? cached : null;
             }
         }
-
         public static void Set(string key, string html)
         {
             lock (_lock)
@@ -4449,7 +3583,6 @@ transition: all 0.2s ease;
                 _cache[key] = System.Text.Encoding.UTF8.GetBytes(html);
             }
         }
-
         public static int TotalCacheSize
         {
             get
@@ -4460,12 +3593,10 @@ transition: all 0.2s ease;
                 }
             }
         }
-
         public static string IndexKey(bool isAuthenticated) => isAuthenticated ? "index:auth" : "index:guest";
         public static string ServerDetailKey(string wipeId, bool isAuthenticated) => $"server:{wipeId}:{(isAuthenticated ? "auth" : "guest")}";
         public static string Viewer3DKey(string wipeId) => $"viewer3d:{wipeId}";
     }
-
     public class HTML
     {
         private static string EscapeJavaScriptString(string s)
@@ -4473,41 +3604,34 @@ transition: all 0.2s ease;
             if (s == null) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("'", "\\'");
         }
-
         public static byte[] GetIndexHtmlBytes(bool isAuthenticated)
         {
             var key = HtmlCache.IndexKey(isAuthenticated);
             var cached = HtmlCache.Get(key);
             if (cached != null) return cached;
-
             var html = GenerateIndexHtml(isAuthenticated);
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
-
         public static byte[] GetServerDetailHtmlBytes(string wipeId, bool isAuthenticated)
         {
             var key = HtmlCache.ServerDetailKey(wipeId, isAuthenticated);
             var cached = HtmlCache.Get(key);
-            if (cached != null) 
+            if (cached != null)
                 return cached;
-
             var html = GenerateServerDetailHtml(wipeId, isAuthenticated);
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
-
         public static byte[] Get3DViewerHtmlBytes(string wipeId)
         {
             var key = HtmlCache.Viewer3DKey(wipeId);
             var cached = HtmlCache.Get(key);
             if (cached != null) return cached;
-
             var html = Generate3DViewerHtml(wipeId);
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
-
         public static string Generate3DViewerHtml(string WipeID)
         {
             return @"<!DOCTYPE html>
@@ -4518,6 +3642,7 @@ transition: all 0.2s ease;
 <meta name=""apple-mobile-web-app-capable"" content=""yes"">
 <meta name=""apple-mobile-web-app-status-bar-style"" content=""black-translucent"">
 <title>3D Map</title>
+<link rel=""icon"" type=""image/x-icon"" href=""/favicon.ico"">
 <style>
 " + HtmlStyles.Get3DViewerStyles() + @"
 </style>
@@ -4545,7 +3670,7 @@ transition: all 0.2s ease;
 <label><input type=""checkbox"" id=""showWater"" checked> Water</label>
 <label><input type=""checkbox"" id=""showLabels"" checked> Labels</label>
 <label><input type=""checkbox"" id=""showEntities"" checked> Entities</label>
-<label><input type=""checkbox"" id=""showUnlimitedView""> Unlimited View</label>
+<label><input type=""checkbox"" id=""showCubes"" checked> Cubes</label>
 </div>
 <div id=""controls"">
 <h3>Navigation Controls</h3>
@@ -4560,6 +3685,7 @@ transition: all 0.2s ease;
 <p>Position: <span class=""coord"" id=""pos-display"">0, 0, 0</span></p>
 <p>Rotation: <span class=""coord"" id=""rot-display"">0, 0, 0</span></p>
 <p>Entities: <span class=""coord"" id=""entity-count"">0</span></p>
+<p>Visible: <span class=""coord"" id=""visible-count"">0</span></p>
 </div>
 <script src=""https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js""></script>
 <script src=""https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js""></script>
@@ -4595,9 +3721,12 @@ let showWater = true;
 let showBB = true;
 let showLabels = true;
 let showEntities = true;
-let showUnlimitedView = false;
+let showCubes = true;
+let showUnlimitedView = true;
 let waterMesh = null;
-let roadInstancer, railInstancer, riverInstancer;
+let roadInstancer, railInstancer, riverInstancer, cubeInstancer;
+let cubeCount = 0;
+const MAX_CUBE_PREFABS = 10000;
 const debugEl = document.getElementById('debug-info');
 const ROAD_HEIGHT_OFFSET = 0.5;
 const RAIL_HEIGHT_OFFSET = 0.8;
@@ -4630,6 +3759,27 @@ let isDucking = false;
 let baseCameraY = 1.6;
 const collisionRaycaster = new THREE.Raycaster();
 const rayDownDirection = new THREE.Vector3(0, -1, 0);
+function getVisualConfig(typeClass) {
+const defaultConfig = { showAmmo: false, label: '' };
+if (!typeClass) return defaultConfig;
+const lower = typeClass.toLowerCase();
+if (lower.includes('player')) return { showAmmo: false, label: 'Player' };
+if (lower.includes('weapon')) return { showAmmo: true, label: 'Weapon' };
+if (lower.includes('vehicle')) return { showAmmo: false, label: 'Vehicle' };
+if (lower.includes('npc')) return { showAmmo: false, label: 'NPC' };
+if (lower.includes('building') || lower.includes('block')) return { showAmmo: false, label: 'Building' };
+if (lower.includes('item') || lower.includes('world')) return { showAmmo: false, label: 'Item' };
+return defaultConfig;
+}
+const EXPLOSION_TYPES = {
+4089790239: { name: 'Grenade', color: 0xffaa00, size: 3, particles: 20 },
+2253809414: { name: 'Rocket', color: 0xff4400, size: 6, particles: 40 },
+1437504946: { name: 'FireRocket', color: 0xff2200, size: 5, particles: 50 },
+1350996199: { name: 'MLRS', color: 0xffcc00, size: 8, particles: 60 },
+1161374517: { name: 'MLRS', color: 0xffcc00, size: 8, particles: 60 },
+857997843:  { name: 'C4', color: 0xffffff, size: 10, particles: 80 } 
+};
+function isExplosionEffect(entityId) { return !!EFFECT_CONFIGS[entityId];}
 const BBMarkerConfig = {
 'underwater_lab': { size: [200, 100, 200], type: 'cube', opacity: 0.2 },
 'entrance_bunker': { size: [100, 74, 100], type: 'cube', opacity: 0.2 },
@@ -4698,11 +3848,38 @@ let lastEntityTimestamp = 0;
 let entityUpdateInterval = null;
 const ENTITY_UPDATE_INTERVAL = 100;
 const ENTITY_LERP_SPEED = 10;
+const entityPool = {
+marker: [],
+maxPoolSize: 500
+};
+const frustum = new THREE.Frustum();
+const projScreenMatrix = new THREE.Matrix4();
+const visibleEntities = new Set();
+let lastFrustumUpdate = 0;
+const FRUSTUM_UPDATE_INTERVAL = 100;
+let visibilityDirty = true;
+let lastVisibilityUpdate = 0;
+const VISIBILITY_UPDATE_INTERVAL = 150;
+const sharedMarkerMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffff, opacity: 0.9, transparent: true });
+const sharedMarkerGeometry = new THREE.BoxGeometry(3, 3, 3);
+function getPooledMarker() {
+if (entityPool.marker.length > 0) {
+return entityPool.marker.pop();
+}
+const marker = new THREE.Mesh(sharedMarkerGeometry, sharedMarkerMaterial);
+return marker;
+}
+function returnToPool(marker) {
+if (entityPool.marker.length < entityPool.maxPoolSize) {
+scene.remove(marker);
+entityPool.marker.push(marker);
+}
+}
 function isBBMarkerType(prefabName) { return BBMarkerConfig.hasOwnProperty(prefabName); }
 function getBBConfig(label) { return BBMarkerConfig[label] || null; }
 function createBBSphereMarker(x, y, z, radius, label, opacity) {
 opacity = opacity || 0.4;
-const geometry = new THREE.SphereGeometry(radius, 32, 32);
+const geometry = new THREE.SphereGeometry(radius, 16, 16);
 const material = new THREE.MeshBasicMaterial({
 color: 0xff0000,
 transparent: true,
@@ -4790,13 +3967,14 @@ showWater = applyCheckboxState('showWater', true);
 showLabels = applyCheckboxState('showLabels', true);
 showDebug = applyCheckboxState('showDebug', false);
 showEntities = applyCheckboxState('showEntities', true);
-showUnlimitedView = applyCheckboxState('showUnlimitedView', false);
+showCubes = applyCheckboxState('showCubes', true);
 if (showDebug) { debugEl.classList.remove('hidden');} else { debugEl.classList.add('hidden');}
 function applyInitialVisibility() {
 if (roadInstancer) roadInstancer.visible = showRoads;
 if (railInstancer) railInstancer.visible = showRails;
 if (waterMesh) waterMesh.visible = showWater;
 if (riverInstancer) riverInstancer.visible = showWater;
+if (cubeInstancer) cubeInstancer.visible = showPrefabs && showCubes;
 prefabMarkers.forEach(function(m) { m.visible = showPrefabs; });
 BBMarkers.forEach(function(m) { m.visible = showBB; });
 prefabLabels.forEach(function(m) { m.visible = showLabels; });
@@ -4815,6 +3993,9 @@ debugEl.scrollTop = debugEl.scrollHeight;
 function updateEntityCountDisplay() {
 const count = entityMeshes.size;
 document.getElementById('entity-count').textContent = count;
+}
+function updateVisibleCountDisplay() {
+document.getElementById('visible-count').textContent = visibleEntities.size;
 }
 function base64ToInt16Array(base64) {
 try {
@@ -4884,6 +4065,15 @@ instanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 scene.add(instanced);
 return instanced;
 }
+function createCubeInstancer(maxCubes) {
+const geometry = new THREE.BoxGeometry(1, 1, 1);
+const material = new THREE.MeshBasicMaterial({ color: 0x00ff00, opacity: 0.5, transparent: true });
+const instanced = new THREE.InstancedMesh(geometry, material, maxCubes);
+instanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+instanced.count = 0;
+scene.add(instanced);
+return instanced;
+}
 function initInstancers(terrainData) {
 const maxRoadSegs = terrainData.roads ? terrainData.roads.reduce(function(s, r) { return s + r.length; }, 0) : 0;
 const maxRailSegs = terrainData.rail ? terrainData.rail.reduce(function(s, r) { return s + r.length; }, 0) : 0;
@@ -4891,6 +4081,7 @@ const maxRiverSegs = terrainData.river ? terrainData.river.reduce(function(s, r)
 roadInstancer = createSegmentInstancer(maxRoadSegs, 8, 0.5, 0x111111);
 railInstancer = createSegmentInstancer(maxRailSegs, 3, 0.5, 0x3d2b1f);
 riverInstancer = createSegmentInstancer(maxRiverSegs, 8, 0.2, 0x87CEEB);
+cubeInstancer = createCubeInstancer(MAX_CUBE_PREFABS);
 }
 async function loadEntityOffsets(prefabName) {
 const modelUrl = window.location.origin + '/models/' + prefabName + '.json';
@@ -4942,7 +4133,7 @@ const combinedRotY = baseRotY + (rotOffset.y || 0);
 const combinedRotZ = baseRotZ + (rotOffset.z || 0);
 const normalizedRot = {
 x: -combinedRotX,
-y: 180 - combinedRotY, 
+y: 180 - combinedRotY,
 z: -combinedRotZ
 };
 const normalizedEuler = new THREE.Euler(
@@ -4951,12 +4142,12 @@ THREE.MathUtils.degToRad(normalizedRot.y),
 THREE.MathUtils.degToRad(normalizedRot.z),
 'YXZ'
 );
-const normalizedQuat = new THREE.Quaternion().setFromEuler(normalizedEuler);   
+const normalizedQuat = new THREE.Quaternion().setFromEuler(normalizedEuler);
 let localOffset = new THREE.Vector3(0, 0, 0);
 if (posOffset) {
 localOffset.set(posOffset.x || 0, posOffset.y || 0, posOffset.z || 0);
 localOffset.applyQuaternion(normalizedQuat);
-} 
+}
 const finalPosition = normalizedPos.clone().add(localOffset);
 obj.position.copy(finalPosition);
 obj.quaternion.copy(normalizedQuat);
@@ -4969,14 +4160,15 @@ const scaleY = glbScale.y * (scaleOff.y || 1);
 const scaleZ = glbScale.z * (scaleOff.z || 1);
 obj.scale.set(scaleX, scaleY, scaleZ);
 }
-function addEntityLabel(prefabName, x, y, z) {
+const LABEL_CREATION_DISTANCE = 1000;
+function addEntityLabel(prefabName, x, y, z, isPlayer = false) {
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 canvas.width = 512;
 canvas.height = 128;
-ctx.fillStyle = 'rgba(0, 50, 100, 0.8)';
+ctx.fillStyle = isPlayer ? 'rgba(100, 50, 0, 0.8)' : 'rgba(0, 50, 100, 0.8)';
 ctx.fillRect(0, 0, 512, 128);
-ctx.fillStyle = '#00ffff';
+ctx.fillStyle = isPlayer ? '#ffaa00' : '#00ffff';
 ctx.font = 'bold 28px Arial';
 ctx.textAlign = 'center';
 ctx.fillText(prefabName, 256, 64);
@@ -4984,13 +4176,15 @@ const texture = new THREE.CanvasTexture(canvas);
 const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: true });
 const sprite = new THREE.Sprite(spriteMat);
 sprite.position.set(x, y + 5, z);
-sprite.scale.set(60, 15, 1);
+sprite.scale.set(12, 3, 1);
 sprite.visible = showLabels && showEntities;
+sprite.userData.labelOffset = 5;
+sprite.userData.isPlayer = isPlayer;
 scene.add(sprite);
 return sprite;
 }
 async function spawnEntity(entityData) {
-const entityId = entityData.id ?? entityData.id;
+const entityId = entityData.id ?? entityData.Id;
 const prefabName = (entityData.PrefabName || entityData.Prefab || entityData.prefabName || 'Unknown').replace(/\.prefab$/i, '');
 const isDestroyed = entityData.isdestroyed === true || entityData.isdestroyed === 1 || entityData.isdestroyed === ""true"";
 if (isDestroyed) {
@@ -5011,25 +4205,46 @@ const unityZ = pos.Z !== undefined ? pos.Z : (pos.z !== undefined ? pos.z : (pos
 const unityRotX = rot.X !== undefined ? rot.X : (rot.x !== undefined ? rot.x : (rot[0] || 0));
 const unityRotY = rot.Y !== undefined ? rot.Y : (rot.y !== undefined ? rot.y : (rot[1] || 0));
 const unityRotZ = rot.Z !== undefined ? rot.Z : (rot.z !== undefined ? rot.z : (rot[2] || 0));
+const typeClass = entityData.typeClass || entityData.TypeClass || '';
+const maxHealth = entityData.maxHealth ?? entityData.MaxHealth ?? 0;
+const durability = entityData.durability ?? entityData.Durability ?? 0;
+const maxDurability = entityData.maxDurability ?? entityData.MaxDurability ?? 0;
+const ammo = entityData.ammo ?? entityData.Ammo ?? 0;
+const maxAmmo = entityData.maxAmmo ?? entityData.MaxAmmo ?? 0;
+const ownerId = entityData.ownerId ?? entityData.OwnerId ?? 0;
+const ownerName = entityData.ownerName || entityData.OwnerName || '';
+const playerName = entityData.playerName || entityData.Playername || '';
+const visual = getVisualConfig(typeClass);
+const healthPct = maxHealth > 0 ? Math.min(entityData.health / maxHealth, 1) : 0;
+let ammoText = (visual.showAmmo && maxAmmo > 0) ? `${ammo}/${maxAmmo}` : '';
+let labelName = ownerName || playerName || visual.label || prefabName;
 const modelUrl = window.location.origin + '/models/' + prefabName + '.glb';
 let offsets;
-try { 
-offsets = await loadPrefabOffset(prefabName); 
-} catch (err) { 
-console.error('Failed to load offsets for ' + prefabName + ', using defaults.', err); 
-offsets = { positionOffset: { x: 0, y: 0, z: 0 }, rotationOffset: { x: 0, y: 0, z: 0 }, scaleMultiplier: { x: 1, y: 1, z: 1 } }; 
-}  
+try {
+offsets = await loadPrefabOffset(prefabName);
+} catch (err) {
+console.error('Failed to load offsets for ' + prefabName + ', using defaults.', err);
+offsets = { positionOffset: { x: 0, y: 0, z: 0 }, rotationOffset: { x: 0, y: 0, z: 0 }, scaleMultiplier: { x: 1, y: 1, z: 1 } };
+}
+const isPlayerEntity = playerName.length > 0 || typeClass.toLowerCase().includes('player') || typeClass.toLowerCase().includes('human');
 if (loadedGLBModels[modelUrl]) {
 const cached = loadedGLBModels[modelUrl];
 const model = cached.scene.clone();
 applyEntityTransform(model, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets);
 model.visible = showEntities;
+model.userData.isEntity = true;
+model.userData.needsLabel = true;
+model.userData.isPlayer = isPlayerEntity;
 scene.add(model);
 entityMeshes.set(entityId, model);
-const label = addEntityLabel(prefabName, model.position.x, model.position.y, model.position.z);
-entityLabels.set(entityId, label);
 entitiesById.set(entityId, entityData);
+const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
+const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
+label.userData.ammo = ammoText;
+label.userData.healthPct = healthPct;
+entityLabels.set(entityId, label);
 updateEntityCountDisplay();
+visibilityDirty = true;
 return;
 }
 await new Promise((resolve, reject) => {
@@ -5038,26 +4253,37 @@ const model = gltf.scene;
 loadedGLBModels[modelUrl] = gltf;
 applyEntityTransform(model, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets);
 model.visible = showEntities;
+model.userData.isEntity = true;
+model.userData.needsLabel = true;
+model.userData.isPlayer = isPlayerEntity;
 scene.add(model);
 entityMeshes.set(entityId, model);
-const label = addEntityLabel(prefabName, model.position.x, model.position.y, model.position.z);
-entityLabels.set(entityId, label);
 entitiesById.set(entityId, entityData);
+const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
+const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
+label.userData.ammo = ammoText;
+label.userData.healthPct = healthPct;
+entityLabels.set(entityId, label);
 updateEntityCountDisplay();
+visibilityDirty = true;
 resolve();
 }, function(error) {
-const markerGeo = new THREE.BoxGeometry(3, 3, 3);
-const markerMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, opacity: 0.9, transparent: true });
-const marker = new THREE.Mesh(markerGeo, markerMat);
+const marker = getPooledMarker();
 marker.visible = showEntities;
+marker.userData.isEntity = true;
+marker.userData.needsLabel = true;
+marker.userData.isPlayer = isPlayerEntity;
 scene.add(marker);
 entityMeshes.set(entityId, marker);
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
-const label = addEntityLabel(prefabName, markerPos.x, markerPos.y, markerPos.z);
+const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
+label.userData.ammo = ammoText;
+label.userData.healthPct = healthPct;
 entityLabels.set(entityId, label);
 entitiesById.set(entityId, entityData);
 updateEntityCountDisplay();
 marker.position.copy(markerPos);
+visibilityDirty = true;
 resolve();
 });
 });
@@ -5087,46 +4313,103 @@ const adjustedX = unityX + (posOffset.x || 0);
 const adjustedY = unityY + (posOffset.y || 0);
 const adjustedZ = unityZ + (posOffset.z || 0);
 const targetPos = transformPositionFromUnity(adjustedX, adjustedY, adjustedZ);
-const targetRot = new THREE.Euler(
-THREE.MathUtils.degToRad(unityRotX),
-THREE.MathUtils.degToRad(unityRotY),
-THREE.MathUtils.degToRad(unityRotZ),
+const combinedRotX = unityRotX;
+const combinedRotY = unityRotY;
+const combinedRotZ = unityRotZ;
+const normalizedRot = {
+x: -combinedRotX,
+y: 180 - combinedRotY,
+z: -combinedRotZ
+};
+const normalizedEuler = new THREE.Euler(
+THREE.MathUtils.degToRad(normalizedRot.x),
+THREE.MathUtils.degToRad(normalizedRot.y),
+THREE.MathUtils.degToRad(normalizedRot.z),
 'YXZ'
 );
-const targetQuat = new THREE.Quaternion().setFromEuler(targetRot);
+const targetQuat = new THREE.Quaternion().setFromEuler(normalizedEuler);
 entityTargets.set(entityId, {
 position: targetPos,
 quaternion: targetQuat,
 labelOffset: 5
 });
 entitiesById.set(entityId, entityData);
+visibilityDirty = true;
 }
 function despawnEntity(entityId) {
 const mesh = entityMeshes.get(entityId);
 const label = entityLabels.get(entityId);
-if (mesh) {
-scene.remove(mesh);
-if (mesh.geometry) mesh.geometry.dispose();
-if (mesh.material) {
-if (Array.isArray(mesh.material)) {
-mesh.material.forEach(m => m.dispose());
+if (mesh || entityMeshes.has(entityId)) {
+if (mesh && mesh.userData && mesh.userData.isEntity) {
+if (mesh.geometry === sharedMarkerGeometry) {
+returnToPool(mesh);
 } else {
-mesh.material.dispose();
+scene.remove(mesh);
+if (mesh.geometry && mesh.geometry !== sharedMarkerGeometry) mesh.geometry.dispose();
+if (mesh.material) {
+if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
+else mesh.material.dispose();
+}
 }
 }
 entityMeshes.delete(entityId);
 }
-log('Despawn entity: (ID: ' + entityId + ')', 'success');
+if (label || entityLabels.has(entityId)) {
 if (label) {
 scene.remove(label);
-if (label.material.map) label.material.map.dispose();
-label.material.dispose();
+if (label.material && label.material.map) label.material.map.dispose();
+if (label.material) label.material.dispose();
+}
 entityLabels.delete(entityId);
 }
 entityTargets.delete(entityId);
 entitiesById.delete(entityId);
+visibleEntities.delete(entityId);
+effectTimers.delete(entityId);
 updateEntityCountDisplay();
-log('Despawned entity ID: ' + entityId, 'info');
+visibilityDirty = true;
+}
+
+function updateFrustumCulling() {
+if (Date.now() - lastFrustumUpdate < FRUSTUM_UPDATE_INTERVAL) return;
+lastFrustumUpdate = Date.now();
+camera.updateMatrixWorld();
+projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+frustum.setFromProjectionMatrix(projScreenMatrix);
+}
+function isInFrustum(position) {
+return frustum.containsPoint(position);
+}
+function updateEntityVisibility() {
+if (!visibilityDirty && Date.now() - lastVisibilityUpdate < VISIBILITY_UPDATE_INTERVAL) return;
+lastVisibilityUpdate = Date.now();
+visibilityDirty = false;
+visibleEntities.clear();
+entityMeshes.forEach(function(mesh, entityId) {
+const target = entityTargets.get(entityId);
+const entityData = entitiesById.get(entityId);
+const pos = target ? target.position : mesh.position;
+const inFrustum = isInFrustum(pos);
+const distanceToCamera = camera.position.distanceTo(pos);
+const isPlayer = mesh.userData?.isPlayer || false;
+if (!isPlayer) {
+const playerName = entityData?.playerName || entityData?.Playername || entityData?.playername || '';
+const typeClass = entityData?.typeClass || entityData?.TypeClass || '';
+if (playerName.length > 0 || typeClass.toLowerCase().includes('player') || typeClass.toLowerCase().includes('human')) {
+mesh.userData.isPlayer = true;
+}
+}
+const isVisible = showEntities && inFrustum && (isPlayer || distanceToCamera < 800);
+mesh.visible = isVisible;
+if (isVisible) {
+visibleEntities.add(entityId);
+const label = entityLabels.get(entityId);
+if (label) {
+label.visible = showLabels && (isPlayer || distanceToCamera < LABEL_CREATION_DISTANCE);
+}
+}
+});
+updateVisibleCountDisplay();
 }
 async function loadAllEntities() {
 try {
@@ -5153,129 +4436,86 @@ log('Failed to load entities: ' + error.message, 'error');
 }
 function spawnEffectWithTTL(effect, ttlMs = 5000) {
 const effectId = effect.id ?? effect.Id;
-if (!effectId) {return;}
-spawnEntity(effect);
-if (effectTimers.has(effectId)) {clearTimeout(effectTimers.get(effectId));}
-const timer = setTimeout(() => {despawnEntity(effectId);effectTimers.delete(effectId);}, ttlMs);
+if (!effectId){return;}
+if (effectTimers.has(effectId)) {
+clearTimeout(effectTimers.get(effectId));
+despawnEntity(effectId);
+}
+const config = EXPLOSION_TYPES[effectId] || { color: 0xffff00, size: 2, particles: 15 };
+const explosionGroup = createExplosionParticles(config);
+const pos = effect.pos || { x: 0, y: 0, z: 0 };
+const worldPos = transformPositionFromUnity(pos.x, pos.y, pos.z);
+explosionGroup.position.set(worldPos.x, worldPos.y, worldPos.z);
+scene.add(explosionGroup);
+entityMeshes.set(effectId, explosionGroup);
+const timer = setTimeout(() => {
+despawnEntity(effectId);
+}, ttlMs);
 effectTimers.set(effectId, timer);
 }
-async function pollEntityUpdates() {
-try {
-const url = `/3dmap/update/${WipeID}?cx=${cx}&cy=${cy}&cz=${cz}&unlimited=${showUnlimitedView}`;
-const response = await fetch(url);
-if (!response.ok) throw new Error('HTTP ' + response.status);
-const data = await response.json();
-if (data.entities && Array.isArray(data.entities)) {
-if (data.entities.length > 0) {
-lastEntityTimestamp = data.timestamp || Date.now();
-const updatedIds = new Set();
-for (const entity of data.entities) {
-const entityId = entity.id ?? entity.Id;
-updatedIds.add(entityId);
-await spawnEntity(entity);
+function createExplosionParticles(config) {
+const group = new THREE.Group();
+const particleCount = config.particles;
+const geometry = new THREE.SphereGeometry(0.1, 8, 8);
+const material = new THREE.MeshBasicMaterial({ 
+color: config.color,
+transparent: true,
+opacity: 1
+});
+for (let i = 0; i < particleCount; i++) {
+const p = new THREE.Mesh(geometry, material.clone());
+p.userData.velocity = new THREE.Vector3(
+(Math.random() - 0.5) * config.size * 0.2,
+(Math.random() - 0.5) * config.size * 0.2,
+(Math.random() - 0.5) * config.size * 0.2
+);
+group.add(p);
 }
-const removedIds = entityData._removedIds || [];
-for (const removedId of removedIds) {
-despawnEntity(removedId);
+group.userData.isEntity = true; 
+group.userData.startTime = Date.now();
+group.userData.config = config; 
+return group;
 }
-}
-}
-if (data.effects && Array.isArray(data.effects)) {
-for (const effect of data.effects) {
-await spawnEntity(effect);
-}
-}
-} catch (error) {
-log('Entity update error: ' + error.message, 'error');
-}
-}
-function startEntityUpdates() {
-if (entityUpdateInterval) return;
-loadAllEntities().then(() => {
-entityUpdateInterval = setInterval(pollEntityUpdates, ENTITY_UPDATE_INTERVAL);
+function animateEffects() {
+const now = Date.now();
+entityMeshes.forEach((mesh, id) => {
+if (mesh instanceof THREE.Group && mesh.children.length > 0 && mesh.children[0].userData.velocity) {
+mesh.children.forEach(p => {
+p.position.add(p.userData.velocity);
+p.material.opacity *= 0.96;
+p.scale.multiplyScalar(0.98);
 });
 }
-function stopEntityUpdates() {
-if (entityUpdateInterval) {
-clearInterval(entityUpdateInterval);
-entityUpdateInterval = null;
-}
-}
-const removedEntityIds = new Set();
-function removeEntityById(entityId) {
-removedEntityIds.add(entityId);
-}
-async function loadAllEntities() {
-try {
-const response = await fetch('/3dmap/entities/" + WipeID + @"');
-if (!response.ok) throw new Error('HTTP ' + response.status);
-const data = await response.json();
-if (data.entities && Array.isArray(data.entities)) {
-lastEntityTimestamp = data.timestamp || 0;
-log('Loading ' + data.entities.length + ' entities...', 'info');
-for (const entity of data.entities) {
-const isDestroyed = entity.isdestroyed === true || entity.isdestroyed === 1 || entity.isdestroyed === ""true"";
-if (isDestroyed) {
-removeEntityById(entity.id || entity.id);
-} else {
-await spawnEntity(entity);
-}
-}
-log('Loaded ' + entityMeshes.size + ' entities', 'success');
-}
-if (data.effects && Array.isArray(data.effects)) {
-log('Processing ' + data.effects.length + ' effects...', 'info');
-for (const effect of data.effects) {
-if (effect.isdestroyed) {
-removeEntityById(effect.Id || effect.id);
-} else {
-await spawnEntity(effect);
-}
-}
-}
-} catch (error) {
-log('Failed to load entities: ' + error.message, 'error');
-}
+});
 }
 async function pollEntityUpdates() {
 try {
-const cx = camera.position.x;
-const cy = camera.position.y;
-const cz = -camera.position.z;
+const cx = camera.position.x, cy = camera.position.y, cz = -camera.position.z;
 const url = '/3dmap/update/" + WipeID + @"?cx=' + cx + '&cy=' + cy + '&cz=' + cz + '&unlimited=' + showUnlimitedView;
 const response = await fetch(url);
 if (!response.ok) throw new Error('HTTP ' + response.status);
 const data = await response.json();
 if (data.entities && Array.isArray(data.entities)) {
-if (data.entities.length > 0) {
-lastEntityTimestamp = data.timestamp || Date.now();
 for (const entity of data.entities) {
 const entityId = entity.id ?? entity.Id;
-const isDestroyed = entity.isdestroyed === true || entity.isdestroyed === 1 || entity.isdestroyed === ""true"";
-if (isDestroyed) {despawnEntity(entityId);continue;}
+const isDestroyed = entity.isdestroyed === true || entity.isdestroyed === 1 || String(entity.isdestroyed) === ""true"";
+if (isDestroyed) { despawnEntity(entityId); continue; }
 spawnEntity(entity);
 }
 }
 if (data.removedIds && Array.isArray(data.removedIds)) {
-for (const removedId of data.removedIds) {
-if (entityMeshes.has(removedId)) {
-despawnEntity(removedId);
-}
-}
-}
+for (const removedId of data.removedIds) despawnEntity(removedId);
 }
 if (data.effects && Array.isArray(data.effects)) {
 for (const effect of data.effects) {
 const effectId = effect.id ?? effect.Id;
-if (effect.isdestroyed) {
-if (entityMeshes.has(effectId)) {
-despawnEntity(effectId);}
-} else {spawnEffectWithTTL(effect, 5000);}
+const isDestroyed = effect.isdestroyed === true || String(effect.isdestroyed) === ""true"";
+if (isDestroyed) despawnEntity(effectId);
+else spawnEffectWithTTL(effect, 5000);
 }
 }
-} catch (error) {
-log('Entity update error: ' + error.message, 'error');
-}
+visibilityDirty = true;
+} catch (error) { log('Entity update error: ' + error.message, 'error'); }
 }
 function startEntityUpdates() {
 if (entityUpdateInterval) return;
@@ -5299,6 +4539,7 @@ camera.lookAt(0, 0, -1);
 renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+renderer.info.autoReset = false;
 document.getElementById('canvas-container').appendChild(renderer.domElement);
 const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
 scene.add(ambientLight);
@@ -5430,9 +4671,7 @@ r += channelColors[c][0] * w;
 g += channelColors[c][1] * w;
 b += channelColors[c][2] * w;
 }
-} else {
-r = colorMap.grass[0]; g = colorMap.grass[1]; b = colorMap.grass[2];
-}
+} else {r = colorMap.grass[0]; g = colorMap.grass[1]; b = colorMap.grass[2];}
 colors[i * 3] = r;
 colors[i * 3 + 1] = g;
 colors[i * 3 + 2] = b;
@@ -5447,14 +4686,42 @@ collisionMeshes.push(terrain);
 log('Terrain mesh created', 'success');
 }
 function createWaterMesh() {
-const waterHeight = 1.2;
-const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 1, 1);
-const waterMat = new THREE.MeshPhongMaterial({ color: 0x1a5f7a, transparent: true, opacity: 0.75, shininess: 100, depthWrite: true });
+const waterHeight = 1.32;
+const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 96, 96);  
+const waterMat = new THREE.MeshPhysicalMaterial({
+color: 0x1e6a8a,
+transparent: true,
+opacity: 0.85,
+roughness: 0.1,
+metalness: 0.2,
+clearcoat: 0.5,
+clearcoatRoughness: 0.2,
+reflectivity: 0.8,
+side: THREE.DoubleSide
+}); 
 waterMesh = new THREE.Mesh(waterGeo, waterMat);
 waterMesh.rotation.x = -Math.PI / 2;
 waterMesh.position.y = waterHeight;
 waterMesh.renderOrder = 1;
+waterMesh.userData.isAnimatedWater = true;
+waterMesh.userData.waveOffset = 0;
 scene.add(waterMesh);
+}
+function updateWaterAnimation(delta) {
+if (!waterMesh || !waterMesh.userData.isAnimatedWater) return;
+waterMesh.userData.waveOffset += delta * 0.8;
+const positions = waterMesh.geometry.attributes.position;
+const count = positions.count;
+const t = waterMesh.userData.waveOffset;
+for (let i = 0; i < count; i++) {
+const x = positions.getX(i);
+const y = positions.getY(i);
+const wave = Math.sin(x * 0.015 + t) * 0.5 +
+Math.sin(y * 0.012 + t * 0.7) * 0.4;
+positions.setZ(i, wave);
+}
+positions.needsUpdate = true;
+waterMesh.geometry.computeVertexNormals();
 }
 function getTerrainHeightAt(worldX, worldZ) {
 if (!window.terrainHeights || !window.terrainResolution) return 0;
@@ -5557,6 +4824,20 @@ tempScale.set(1, 1, length);
 tempMatrix.compose(tempPos, tempQuat, tempScale);
 instancer.setMatrixAt(index, tempMatrix);
 }
+function addCubeInstance(index, x, y, z, scaleX, scaleY, scaleZ) {
+tempPos.set(x, y, z);
+tempQuat.identity();
+tempScale.set(scaleX, scaleY, scaleZ);
+tempMatrix.compose(tempPos, tempQuat, tempScale);
+cubeInstancer.setMatrixAt(index, tempMatrix);
+}
+function finalizeCubeInstancer() {
+if (cubeInstancer) {
+cubeInstancer.count = cubeCount;
+cubeInstancer.instanceMatrix.needsUpdate = true;
+log('Created ' + cubeCount + ' instanced cube prefabs', 'success');
+}
+}
 function initGLTFLoader() { if (typeof THREE.GLTFLoader !== 'undefined') { gltfLoader = new THREE.GLTFLoader(); } else { log('GLTFLoader not available, will use cube markers', 'error'); } }
 function loadGLBModel(url, onLoad, onError) {
 if (!gltfLoader) { if (onError) onError('GLTFLoader not initialized'); return; }
@@ -5638,6 +4919,23 @@ const scaleData = prefab.scale || prefab.Scale || { x: 1, y: 1, z: 1 };
 const baseScale = { x: scaleData[0] !== undefined ? scaleData[0] : (scaleData.x || 1), y: scaleData[1] !== undefined ? scaleData[1] : (scaleData.y || 1), z: scaleData[2] !== undefined ? scaleData[2] : (scaleData.z || 1) };
 const prefabName = prefab.name || 'Unknown';
 if (isBBMarkerType(prefabName)) { createBBMarkerFromPrefab(prefab); }
+if (prefabName.includes('cube') || prefabName.includes('invisible_collider')) {
+if (cubeInstancer && cubeCount < MAX_CUBE_PREFABS) {
+const markerPos = transformPositionFromUnity(unityX, unityY + 2, unityZ);
+addCubeInstance(cubeCount, markerPos.x, markerPos.y, markerPos.z, baseScale.x, baseScale.y, baseScale.z);
+cubeCount++;
+} else if (!cubeInstancer) {
+const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
+const markerGeo = new THREE.BoxGeometry(baseScale.x, baseScale.y, baseScale.z);
+const markerMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, opacity: 0.5, transparent: true });
+const marker = new THREE.Mesh(markerGeo, markerMat);
+marker.position.set(markerPos.x, markerPos.y, markerPos.z);
+marker.visible = showPrefabs && showCubes;
+scene.add(marker);
+prefabMarkers.push(marker);
+}
+return;
+}
 const shouldSkipModel = prefabName.includes('cave_') || prefabName.includes('swamp_') || prefabName.includes('ice_lake') || prefabName.includes('water_well') || prefabName.includes('ue_jungle_swamp') || prefabName.includes('ue_lake') || prefabName.includes('ue_oasis') || prefabName.includes('ue_canyon');
 if (shouldSkipModel) {
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
@@ -5673,7 +4971,7 @@ createCubeMarker(prefabName, unityX, unityY, -unityZ);
 });
 }
 function drawPrefabs(prefabsData) {
-const maxPrefabs = Math.min(prefabsData.length, 500);
+const maxPrefabs = prefabsData.length;
 let bbCount = 0;
 for (let i = 0; i < maxPrefabs; i++) {
 const prefab = prefabsData[i];
@@ -5681,6 +4979,7 @@ const prefabName = prefab.name || 'Unknown';
 if (isBBMarkerType(prefabName)) { bbCount++; }
 processPrefab(prefabsData[i], i);
 }
+finalizeCubeInstancer();
 if (bbCount > 0) { log('Created ' + bbCount + ' PreventBuilding markers', 'success'); }
 log('Started processing ' + maxPrefabs + ' prefabs', 'success');
 }
@@ -5698,7 +4997,7 @@ const texture = new THREE.CanvasTexture(canvas);
 const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: true });
 const sprite = new THREE.Sprite(spriteMat);
 sprite.position.set(x, y + 10, z);
-sprite.scale.set(80, 20, 1);
+sprite.scale.set(16, 4, 1);
 sprite.visible = showLabels;
 scene.add(sprite);
 prefabLabels.push(sprite);
@@ -5804,12 +5103,14 @@ state['showEntities'] = showEntities;
 saveLayerState(state);
 entityMeshes.forEach(function(m) { m.visible = showEntities; });
 entityLabels.forEach(function(m) { m.visible = showLabels && showEntities; });
+visibilityDirty = true;
 });
-document.getElementById('showUnlimitedView').addEventListener('change', function(e) {
-showUnlimitedView = e.target.checked;
+document.getElementById('showCubes').addEventListener('change', function(e) {
+showCubes = e.target.checked;
 const state = loadLayerState();
-state['showUnlimitedView'] = showUnlimitedView;
+state['showCubes'] = showCubes;
 saveLayerState(state);
+if (cubeInstancer) cubeInstancer.visible = showPrefabs && showCubes;
 });
 }
 function setupControls() {
@@ -6023,13 +5324,13 @@ if (noClipMode) {
 renderer.domElement.requestPointerLock();
 playerVelocity.set(0, 0, 0);
 isGrounded = true;
-log('Noclip ON - Fly mode active', 'info');
+log('Noclip OFF', 'info');
 } else {
 const groundHeight = getGroundHeightAt(camera.position.x, camera.position.z);
 camera.position.y = groundHeight + baseCameraY;
 playerVelocity.set(0, 0, 0);
 isDucking = false;
-log('Noclip OFF - Physics mode active', 'info');
+log('Noclip ON', 'info');
 }
 });
 }
@@ -6114,25 +5415,40 @@ function animate() {
 requestAnimationFrame(animate);
 const delta = (performance.now() - lastTime) / 1000;
 lastTime = performance.now();
+animateEffects();
+updateWaterAnimation(delta);
 updateMovement(delta);
 updateRotationDisplay();
+updateFrustumCulling();
+updateEntityVisibility();
 updateEntityLerp(delta);
 renderer.render(scene, camera);
 }
-
+const _tempQuat = new THREE.Quaternion();
 function updateEntityLerp(delta) {
 const lerpFactor = Math.min(1, ENTITY_LERP_SPEED * delta);
 entityTargets.forEach(function(target, entityId) {
 const mesh = entityMeshes.get(entityId);
-const label = entityLabels.get(entityId);
 if (!mesh) return;
+const isPlayer = mesh.userData && mesh.userData.isPlayer;
+if (!mesh.visible && !isPlayer) return;
+const distance = mesh.position.distanceTo(target.position);
+if (distance >= 0.01) {
 mesh.position.lerp(target.position, lerpFactor);
+}
 const currentQuat = new THREE.Quaternion();
 mesh.getWorldQuaternion(currentQuat);
-const slerpQuat = currentQuat.slerp(target.quaternion, lerpFactor);
+const targetQuat = target.quaternion.clone();
+const angleDiff = currentQuat.angleTo(targetQuat);
+if (angleDiff > 0.001) {
+const slerpQuat = currentQuat.slerp(targetQuat, lerpFactor);
 mesh.quaternion.copy(slerpQuat);
+}
+const label = entityLabels.get(entityId);
 if (label) {
+if (isPlayer || label.visible) {
 label.position.set(mesh.position.x, mesh.position.y + target.labelOffset, mesh.position.z);
+}
 }
 });
 }
@@ -6141,7 +5457,6 @@ init();
 </body>
 </html>";
         }
-
         public static string GenerateServerDetailHtml(string wipeId, bool isAuthenticated)
         {
             string html;
@@ -6150,21 +5465,22 @@ init();
                 html = @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
-    <meta charset=""UTF-8"">
-    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-    <title>Server Details - " + wipeId + @"</title>
-    <style>
-        " + HtmlStyles.GetBaseStyles() + @"
-    </style>
+<meta charset=""UTF-8"">
+<meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
+<title>Server Details - " + wipeId + @"</title>
+<link rel=""icon"" type=""image/x-icon"" href=""/favicon.ico"">
+<style>
+" + HtmlStyles.GetBaseStyles() + @"
+</style>
 </head>
 <body>
-    <div class=""container"">
-        <div class=""card"" style=""max-width: 300px; margin: 100px auto;"">
-            <h1 class=""title"">Authentication Required</h1>
-            <p class=""subtitle"">Please login to view server details</p>
-            <a href=""/"" class=""action-btn"" style=""display: block; text-align: center; margin-top: 20px;"">Go to Login</a>
-        </div>
-    </div>
+<div class=""container"">
+<div class=""card"" style=""max-width: 300px; margin: 100px auto;"">
+<h1 class=""title"">Authentication Required</h1>
+<p class=""subtitle"">Please login to view server details</p>
+<a href=""/"" class=""action-btn"" style=""display: block; text-align: center; margin-top: 20px;"">Go to Login</a>
+</div>
+</div>
 </body>
 </html>";
             }
@@ -6173,352 +5489,318 @@ init();
                 html = @"<!DOCTYPE html>
 <html lang=""en"">
 <head>
-    <meta charset=""UTF-8"">
-    <meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
-    <title>Server Details - " + wipeId + @"</title>
-    <style>
-        " + HtmlStyles.GetBaseStyles() + @"
-    </style>
+<meta charset=""UTF-8"">
+<meta name=""viewport"" content=""width=device-width, initial-scale=1.0"">
+<title>Server Details - " + wipeId + @"</title>
+<link rel=""icon"" type=""image/x-icon"" href=""/favicon.ico"">
+<style>
+" + HtmlStyles.GetBaseStyles() + @"
+</style>
 </head>
 <body>
-    <div class=""container"">
-        <a href=""/"" class=""back-link"">Back to Dashboard</a>
-        <h1 class=""title"">Server: " + wipeId + @"</h1>
-        <p class=""subtitle"">Server Details and Map Information</p>
-        <div id=""loading"" class=""loading"">Loading server information...</div>
-        <div id=""error"" class=""error-box"" style=""display: none;""></div>
-        <div id=""content"" style=""display: none;"">
-            <div class=""stats"" id=""stats""></div>
-            <div class=""card"">
-                <h2>Server Status</h2>
-                <div class=""info-grid"" id=""serverStatus""></div>
-            </div>
-            <div class=""card"">
-                <h2>Map Information</h2>
-                <p>Map data received from this server</p>
-                <div class=""map-preview"" onclick=""openMapPreview()"">
-                    <img id=""mapPreviewThumb"" alt=""Map Preview"" style=""display:none;"">
-                </div>
-                <h3>World Size: <span id=""worldSize"" class=""highlight""></span></h3>
-                <div id=""mapInfo""></div>
-            </div>
-            <div id=""mapPreviewOverlay"" class=""map-preview-overlay"">
-                <img id=""mapPreviewFull"">
-            </div>
-            <div class=""card"">
-                <h2>Available Files</h2>
-                <div id=""filesSection""></div>
-            </div>
-            <div class=""card"">
-                <h2>Explore</h2>
-                <p>Tools to explore the server data</p>
-                <div class=""action-buttons"">
-                    <a href=""#"" id=""explore3dBtn"" class=""action-btn secondary"">Explore in 3D View</a>
-                    <a href=""#"" id=""exploreSaveBtn"" class=""action-btn secondary"">Explore Save File</a>
-                    <a href=""#"" id=""viewPlayersBtn"" class=""action-btn secondary"">View Players</a>
-                    <a href=""#"" id=""viewEntsBtn"" class=""action-btn secondary"">View Entities</a>
-                </div>
-            </div>
-        </div>
-        <div id=""pathsModal"" class=""modal"">
-            <div class=""modal-content"">
-                <div class=""modal-header"">
-                    <h2>Paths</h2>
-                    <button class=""close-btn"" onclick=""closeModal('pathsModal')"">&times;</button>
-                </div>
-                <div id=""pathsContent""></div>
-            </div>
-        </div>
-        <div id=""prefabsModal"" class=""modal"">
-            <div class=""modal-content"">
-                <div class=""modal-header"">
-                    <h2>Prefabs</h2>
-                    <button class=""close-btn"" onclick=""closeModal('prefabsModal')"">&times;</button>
-                </div>
-                <div id=""prefabsFilterBar"" class=""filter-bar""></div>
-                <div id=""prefabsContent""></div>
-            </div>
-        </div>
-        <script>
-            const WIPE_ID = """ + EscapeJavaScriptString(wipeId) + @""";
-            " + GetServerDetailScript() + @"
-        </script>
-    </div>
+<div class=""container"">
+<a href=""/"" class=""back-link"">Back to Dashboard</a>
+<h1 class=""title"">Server: " + wipeId + @"</h1>
+<p class=""subtitle"">Server Details and Map Information</p>
+<div id=""loading"" class=""loading"">Loading server information...</div>
+<div id=""error"" class=""error-box"" style=""display: none;""></div>
+<div id=""content"" style=""display: none;"">
+<div class=""stats"" id=""stats""></div>
+<div class=""card"">
+<h2>Server Status</h2>
+<div class=""info-grid"" id=""serverStatus""></div>
+</div>
+<div class=""card"">
+<h2>Map Information</h2>
+<p>Map data received from this server</p>
+<div class=""map-preview"" onclick=""openMapPreview()"">
+<img id=""mapPreviewThumb"" alt=""Map Preview"" style=""display:none;"">
+</div>
+<h3>World Size: <span id=""worldSize"" class=""highlight""></span></h3>
+<div id=""mapInfo""></div>
+</div>
+<div id=""mapPreviewOverlay"" class=""map-preview-overlay"">
+<img id=""mapPreviewFull"">
+</div>
+<div class=""card"">
+<h2>Available Files</h2>
+<div id=""filesSection""></div>
+</div>
+<div class=""card"">
+<h2>Explore</h2>
+<p>Tools to explore the server data</p>
+<div class=""action-buttons"">
+<a href=""#"" id=""explore3dBtn"" class=""action-btn secondary"">Explore in 3D View</a>
+<a href=""#"" id=""exploreSaveBtn"" class=""action-btn secondary"">Explore Save File</a>
+<a href=""#"" id=""viewPlayersBtn"" class=""action-btn secondary"">View Players</a>
+<a href=""#"" id=""viewEntsBtn"" class=""action-btn secondary"">View Entities</a>
+</div>
+</div>
+</div>
+<div id=""pathsModal"" class=""modal"">
+<div class=""modal-content"">
+<div class=""modal-header"">
+<h2>Paths</h2>
+<button class=""close-btn"" onclick=""closeModal('pathsModal')"">&times;</button>
+</div>
+<div id=""pathsContent""></div>
+</div>
+</div>
+<div id=""prefabsModal"" class=""modal"">
+<div class=""modal-content"">
+<div class=""modal-header"">
+<h2>Prefabs</h2>
+<button class=""close-btn"" onclick=""closeModal('prefabsModal')"">&times;</button>
+</div>
+<div id=""prefabsFilterBar"" class=""filter-bar""></div>
+<div id=""prefabsContent""></div>
+</div>
+</div>
+<script>
+const WIPE_ID = """ + EscapeJavaScriptString(wipeId) + @""";
+" + GetServerDetailScript() + @"
+</script>
+</div>
 </body>
 </html>";
             }
             return html;
         }
-
         private static string GetServerDetailScript()
         {
             return @"
 async function loadServerDetail() {
-    try {
-        const res = await fetch('/api/server/' + WIPE_ID);
-        if (res.status === 401) { window.location.href = '/'; return; }
-        if (res.status === 404) {
-            document.getElementById('error').textContent = 'Server not found';
-            document.getElementById('error').style.display = 'block';
-            document.getElementById('loading').style.display = 'none';
-            return;
-        }
-        const data = await res.json();
-        displayServerDetail(data);
-    } catch (err) {
-        document.getElementById('error').textContent = 'Failed to load: ' + err.message;
-        document.getElementById('error').style.display = 'block';
-        document.getElementById('loading').style.display = 'none';
-    }
+try {
+const res = await fetch('/api/server/' + WIPE_ID);
+if (res.status === 401) { window.location.href = '/'; return; }
+if (res.status === 404) {
+document.getElementById('error').textContent = 'Server not found';
+document.getElementById('error').style.display = 'block';
+document.getElementById('loading').style.display = 'none';
+return;
 }
-
+const data = await res.json();
+displayServerDetail(data);
+} catch (err) {
+document.getElementById('error').textContent = 'Failed to load: ' + err.message;
+document.getElementById('error').style.display = 'block';
+document.getElementById('loading').style.display = 'none';
+}
+}
 function openMapPreview() {
-    const overlay = document.getElementById('mapPreviewOverlay');
-    const thumb = document.getElementById('mapPreviewThumb');
-    const full = document.getElementById('mapPreviewFull');
-    if (!thumb || !thumb.src) return;
-    full.src = thumb.src;
-    overlay.style.display = 'flex';
-    document.addEventListener('keydown', handlePreviewKeydown);
-    overlay.addEventListener('click', handlePreviewClick);
+const overlay = document.getElementById('mapPreviewOverlay');
+const thumb = document.getElementById('mapPreviewThumb');
+const full = document.getElementById('mapPreviewFull');
+if (!thumb || !thumb.src) return;
+full.src = thumb.src;
+overlay.style.display = 'flex';
+document.addEventListener('keydown', handlePreviewKeydown);
+overlay.addEventListener('click', handlePreviewClick);
 }
-
 function closeMapPreview() {
-    const overlay = document.getElementById('mapPreviewOverlay');
-    if (overlay) overlay.style.display = 'none';
-    document.removeEventListener('keydown', handlePreviewKeydown);
-    overlay.removeEventListener('click', handlePreviewClick);
+const overlay = document.getElementById('mapPreviewOverlay');
+if (overlay) overlay.style.display = 'none';
+document.removeEventListener('keydown', handlePreviewKeydown);
+overlay.removeEventListener('click', handlePreviewClick);
 }
-
 function handlePreviewKeydown(e) { closeMapPreview(); }
 function handlePreviewClick(e) { closeMapPreview(); }
 async function decompressGzipBase64(base64) {
-    try {
-        const binaryString = atob(base64);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) { bytes[i] = binaryString.charCodeAt(i); }
-        const ds = new DecompressionStream('gzip');
-        const decompressedStream = new Response(bytes).body.pipeThrough(ds);
-        const resultBuffer = await new Response(decompressedStream).arrayBuffer();
-        return resultBuffer;
-    } catch (e) { return null; }
+try {
+const binaryString = atob(base64);
+const len = binaryString.length;
+const bytes = new Uint8Array(len);
+for (let i = 0; i < len; i++) { bytes[i] = binaryString.charCodeAt(i); }
+const ds = new DecompressionStream('gzip');
+const decompressedStream = new Response(bytes).body.pipeThrough(ds);
+const resultBuffer = await new Response(decompressedStream).arrayBuffer();
+return resultBuffer;
+} catch (e) { return null; }
 }
 async function decompressData(base64) {
-    const buffer = await decompressGzipBase64(base64);
-    if (!buffer) return null;
-    return new Uint8Array(buffer);
+const buffer = await decompressGzipBase64(base64);
+if (!buffer) return null;
+return new Uint8Array(buffer);
 }
 async function displayServerDetail(data) {
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('content').style.display = 'block';
-    const s = data.server;
-    const totalBytes = s.bytesReceived || 0;
-    const mapInfo = data.mapInfo;
-    const worldSize = mapInfo.worldSize || mapInfo.worldsize || mapInfo.size || 'Unknown';
-    let pngBytes = null;
-    if (mapInfo.png) {pngBytes = await decompressData(mapInfo.png);}
-    if (pngBytes) {
-        const blob = new Blob([pngBytes], { type: 'image/png' });
-        const url = URL.createObjectURL(blob);
-        const thumb = document.getElementById('mapPreviewThumb');
-        thumb.src = url;
-        thumb.style.display = 'block';
-    } else if (mapInfo.mapPng) {
-        const thumb = document.getElementById('mapPreviewThumb');
-        thumb.src = 'data:image/png;base64,' + mapInfo.mapPng;
-        thumb.style.display = 'block';
-    }
-    document.getElementById('worldSize').textContent = worldSize;
-    document.getElementById('stats').innerHTML = '<div class=""stat-box""><div class=""stat-value"">' + s.packetsReceived.toLocaleString() + '</div><div class=""stat-label"">Packets</div></div><div class=""stat-box""><div class=""stat-value"">' + formatBytes(totalBytes) + '</div><div class=""stat-label"">Data Received</div></div><div class=""stat-box clickable"" onclick=""showPrefabs()""><div class=""stat-value"">' + (mapInfo.prefabCount || 0).toLocaleString() + '</div><div class=""stat-label"">Prefabs (click to view)</div></div><div class=""stat-box clickable"" onclick=""showPaths()""><div class=""stat-value"">' + (mapInfo.pathCount || 0).toLocaleString() + '</div><div class=""stat-label"">Paths (click to view)</div></div>';
-
-    document.getElementById('serverStatus').innerHTML = '<div class=""info-item""><div class=""label"">Connected At</div><div class=""value"">' + formatDate(s.connectedAt) + '</div></div><div class=""info-item""><div class=""label"">Last Activity</div><div class=""value"">' + formatDate(s.lastActivity) + '</div></div>';
-    let mapInfoHtml = '<p>No map files available yet.</p>';
-    if (data.files.maps.length > 0) {
-        mapInfoHtml = '<div class=""stats"" style=""margin-bottom:15px;""><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.mapCount || 0) + '</div><div class=""stat-label"">Map Layers</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.prefabCount || 0) + '</div><div class=""stat-label"">Prefabs</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.pathCount || 0) + '</div><div class=""stat-label"">Paths</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.customMonumentCount || 0) + '</div><div class=""stat-label"">Custom Monuments</div></div></div>';
-
-        if (mapInfo.mapNames && mapInfo.mapNames.length > 0) {
-            mapInfoHtml += '<h3>Map Layers <span class=""hint"">click to download</span></h3><div class=""badge-container"">';
-            mapInfo.mapNames.forEach(function(name) { mapInfoHtml += '<span class=""badge badge-info clickable"" onclick=""downloadMapLayer(\'' + name + '\')"">' + name + '</span>'; });
-            mapInfoHtml += '</div>';
-        }
-
-        if (mapInfo.prefabCategories && mapInfo.prefabCategories.length > 0) {
-            mapInfoHtml += '<h3>Prefab Categories <span class=""hint"">click to filter</span></h3><div class=""badge-container"">';
-            mapInfo.prefabCategories.forEach(function(cat) {
-                const count = mapInfo.prefabCategoryCounts[cat] || 0;
-                mapInfoHtml += '<span class=""badge badge-info clickable' + (cat === currentPrefabCategory ? ' active' : '') + '"" onclick=""showPrefabs(\'' + cat + '\')"">' + cat + ' (' + count + ')</span>';
-            });
-            mapInfoHtml += '</div>';
-        }
-
-        if (mapInfo.pathNames && mapInfo.pathNames.length > 0) {
-            mapInfoHtml += '<h3>Paths</h3><div class=""badge-container"">';
-            mapInfo.pathNames.forEach(function(name) { mapInfoHtml += '<span class=""badge badge-warning"">' + name + '</span>'; });
-            mapInfoHtml += '</div>';
-        }
-
-        if (mapInfo.customMonuments && mapInfo.customMonuments.length > 0) {
-            mapInfoHtml += '<h3>Custom Monuments</h3><table class=""data-table""><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>';
-            mapInfo.customMonuments.forEach(function(m) { mapInfoHtml += '<tr><td>' + m.name + '</td><td>' + formatBytes(m.size || 0) + '</td></tr>'; });
-            mapInfoHtml += '</tbody></table>';
-        }
-
-        mapInfoHtml += '<h3>Map Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
-        data.files.maps.forEach(function(f) { mapInfoHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'map\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
-        mapInfoHtml += '</tbody></table>';
-    }
-    document.getElementById('mapInfo').innerHTML = mapInfoHtml;
-
-    let filesHtml = '';
-    if (data.files.snapshots.length > 0) {
-        filesHtml += '<h3>Save Snapshots <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
-        data.files.snapshots.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'snapshot\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
-        filesHtml += '</tbody></table>';
-    }
-
-    if (data.files.stringPools.length > 0) {
-        filesHtml += '<h3>String Pool Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
-        data.files.stringPools.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'stringpool\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
-        filesHtml += '</tbody></table>';
-    }
-
-    if (data.files.manifests.length > 0) {
-        filesHtml += '<h3>Manifest Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
-        data.files.manifests.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'manifest\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
-        filesHtml += '</tbody></table>';
-    }
-
-    if (filesHtml === '') filesHtml = '<p>No additional files available yet.</p>';
-    document.getElementById('filesSection').innerHTML = filesHtml;
-
-    const hasMapData = data.files.maps.length > 0;
-    document.getElementById('explore3dBtn').href = hasMapData ? '/3dviewer/' + WIPE_ID : '#';
-    document.getElementById('explore3dBtn').addEventListener('click', function(e) { if (!hasMapData) { e.preventDefault(); alert('No map data available for 3D view.'); } });
-
-    const hasSnapshot = data.files.snapshots.length > 0;
-    document.getElementById('exploreSaveBtn').href = hasSnapshot ? '/savefile/' + WIPE_ID : '#';
-    document.getElementById('exploreSaveBtn').addEventListener('click', function(e) { if (!hasSnapshot) { e.preventDefault(); alert('No snapshot data available to explore.'); } });
-    document.getElementById('viewPlayersBtn').href = '/viewplayers/' + WIPE_ID;
-    document.getElementById('viewEntsBtn').href = '/viewents/' + WIPE_ID;
+document.getElementById('loading').style.display = 'none';
+document.getElementById('content').style.display = 'block';
+const s = data.server;
+const totalBytes = s.bytesReceived || 0;
+const mapInfo = data.mapInfo;
+const worldSize = mapInfo.worldSize || mapInfo.worldsize || mapInfo.size || 'Unknown';
+let pngBytes = null;
+if (mapInfo.png) {pngBytes = await decompressData(mapInfo.png);}
+if (pngBytes) {
+const blob = new Blob([pngBytes], { type: 'image/png' });
+const url = URL.createObjectURL(blob);
+const thumb = document.getElementById('mapPreviewThumb');
+thumb.src = url;
+thumb.style.display = 'block';
+} else if (mapInfo.mapPng) {
+const thumb = document.getElementById('mapPreviewThumb');
+thumb.src = 'data:image/png;base64,' + mapInfo.mapPng;
+thumb.style.display = 'block';
+}
+document.getElementById('worldSize').textContent = worldSize;
+document.getElementById('stats').innerHTML = '<div class=""stat-box""><div class=""stat-value"">' + s.packetsReceived.toLocaleString() + '</div><div class=""stat-label"">Packets</div></div><div class=""stat-box""><div class=""stat-value"">' + formatBytes(totalBytes) + '</div><div class=""stat-label"">Data Received</div></div><div class=""stat-box clickable"" onclick=""showPrefabs()""><div class=""stat-value"">' + (mapInfo.prefabCount || 0).toLocaleString() + '</div><div class=""stat-label"">Prefabs (click to view)</div></div><div class=""stat-box clickable"" onclick=""showPaths()""><div class=""stat-value"">' + (mapInfo.pathCount || 0).toLocaleString() + '</div><div class=""stat-label"">Paths (click to view)</div></div>';
+document.getElementById('serverStatus').innerHTML = '<div class=""info-item""><div class=""label"">Connected At</div><div class=""value"">' + formatDate(s.connectedAt) + '</div></div><div class=""info-item""><div class=""label"">Last Activity</div><div class=""value"">' + formatDate(s.lastActivity) + '</div></div>';
+let mapInfoHtml = '<p>No map files available yet.</p>';
+if (data.files.maps.length > 0) {
+mapInfoHtml = '<div class=""stats"" style=""margin-bottom:15px;""><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.mapCount || 0) + '</div><div class=""stat-label"">Map Layers</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.prefabCount || 0) + '</div><div class=""stat-label"">Prefabs</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.pathCount || 0) + '</div><div class=""stat-label"">Paths</div></div><div class=""stat-box""><div class=""stat-value"">' + (mapInfo.customMonumentCount || 0) + '</div><div class=""stat-label"">Custom Monuments</div></div></div>';
+if (mapInfo.mapNames && mapInfo.mapNames.length > 0) {
+mapInfoHtml += '<h3>Map Layers <span class=""hint"">click to download</span></h3><div class=""badge-container"">';
+mapInfo.mapNames.forEach(function(name) { mapInfoHtml += '<span class=""badge badge-info clickable"" onclick=""downloadMapLayer(\'' + name + '\')"">' + name + '</span>'; });
+mapInfoHtml += '</div>';
+}
+if (mapInfo.prefabCategories && mapInfo.prefabCategories.length > 0) {
+mapInfoHtml += '<h3>Prefab Categories <span class=""hint"">click to filter</span></h3><div class=""badge-container"">';
+mapInfo.prefabCategories.forEach(function(cat) {
+const count = mapInfo.prefabCategoryCounts[cat] || 0;
+mapInfoHtml += '<span class=""badge badge-info clickable' + (cat === currentPrefabCategory ? ' active' : '') + '"" onclick=""showPrefabs(\'' + cat + '\')"">' + cat + ' (' + count + ')</span>';
+});
+mapInfoHtml += '</div>';
+}
+if (mapInfo.pathNames && mapInfo.pathNames.length > 0) {
+mapInfoHtml += '<h3>Paths</h3><div class=""badge-container"">';
+mapInfo.pathNames.forEach(function(name) { mapInfoHtml += '<span class=""badge badge-warning"">' + name + '</span>'; });
+mapInfoHtml += '</div>';
+}
+if (mapInfo.customMonuments && mapInfo.customMonuments.length > 0) {
+mapInfoHtml += '<h3>Custom Monuments</h3><table class=""data-table""><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>';
+mapInfo.customMonuments.forEach(function(m) { mapInfoHtml += '<tr><td>' + m.name + '</td><td>' + formatBytes(m.size || 0) + '</td></tr>'; });
+mapInfoHtml += '</tbody></table>';
+}
+mapInfoHtml += '<h3>Map Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
+data.files.maps.forEach(function(f) { mapInfoHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'map\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
+mapInfoHtml += '</tbody></table>';
+}
+document.getElementById('mapInfo').innerHTML = mapInfoHtml;
+let filesHtml = '';
+if (data.files.snapshots.length > 0) {
+filesHtml += '<h3>Save Snapshots <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
+data.files.snapshots.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'snapshot\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
+filesHtml += '</tbody></table>';
+}
+if (data.files.stringPools.length > 0) {
+filesHtml += '<h3>String Pool Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
+data.files.stringPools.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'stringpool\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
+filesHtml += '</tbody></table>';
+}
+if (data.files.manifests.length > 0) {
+filesHtml += '<h3>Manifest Files <span class=""hint"">click to download</span></h3><table class=""data-table""><thead><tr><th>File Name</th><th>Size</th><th>Created</th></tr></thead><tbody>';
+data.files.manifests.forEach(function(f) { filesHtml += '<tr class=""clickable"" onclick=""downloadFile(\'' + f.name + '\', \'manifest\')""><td>' + f.name + '</td><td>' + formatBytes(f.size) + '</td><td>' + formatDate(f.created) + '</td></tr>'; });
+filesHtml += '</tbody></table>';
+}
+if (filesHtml === '') filesHtml = '<p>No additional files available yet.</p>';
+document.getElementById('filesSection').innerHTML = filesHtml;
+const hasMapData = data.files.maps.length > 0;
+document.getElementById('explore3dBtn').href = hasMapData ? '/3dviewer/' + WIPE_ID : '#';
+document.getElementById('explore3dBtn').addEventListener('click', function(e) { if (!hasMapData) { e.preventDefault(); alert('No map data available for 3D view.'); } });
+const hasSnapshot = data.files.snapshots.length > 0;
+document.getElementById('exploreSaveBtn').href = hasSnapshot ? '/savefile/' + WIPE_ID : '#';
+document.getElementById('exploreSaveBtn').addEventListener('click', function(e) { if (!hasSnapshot) { e.preventDefault(); alert('No snapshot data available to explore.'); } });
+document.getElementById('viewPlayersBtn').href = '/viewplayers/' + WIPE_ID;
+document.getElementById('viewEntsBtn').href = '/viewents/' + WIPE_ID;
 }
 function formatBytes(bytes) {
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+if (bytes === 0) return '0 B';
+const k = 1024;
+const sizes = ['B', 'KB', 'MB', 'GB'];
+const i = Math.floor(Math.log(bytes) / Math.log(k));
+return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
 }
-
 function formatDate(isoString) {
-    if (!isoString) return 'N/A';
-    const d = new Date(isoString);
-    return d.toLocaleString();
+if (!isoString) return 'N/A';
+const d = new Date(isoString);
+return d.toLocaleString();
 }
-
 function closeModal(modalId) { document.getElementById(modalId).classList.remove('show'); }
-
 document.addEventListener('click', function(e) { if (e.target.classList.contains('modal')) e.target.classList.remove('show'); });
-
 let currentPrefabCategory = 'all';
-
 async function showPaths(page) {
-    page = page || 1;
-    const modal = document.getElementById('pathsModal');
-    modal.classList.add('show');
-    const content = document.getElementById('pathsContent');
-    content.innerHTML = '<p class=""centered"">Loading...</p>';
-    try {
-        const res = await fetch('/api/paths/' + WIPE_ID + '?page=' + page);
-        if (!res.ok) throw new Error('Failed to load paths');
-        const data = await res.json();
-        let html = '<p style=""margin-bottom:10px;"">Total: ' + data.total + ' paths</p>';
-        html += '<table class=""data-table""><thead><tr><th>Name</th><th>Spline</th><th>Width</th><th>Nodes</th></tr></thead><tbody>';
-        data.paths.forEach(function(p) { html += '<tr><td>' + (p.name || 'Unnamed') + '</td><td>' + (p.spline ? 'Yes' : 'No') + '</td><td>' + (p.width ? p.width.toFixed(2) : 'N/A') + '</td><td>' + p.nodes + '</td></tr>'; });
-        html += '</tbody></table>';
-        html += '<div class=""pagination"">';
-        html += '<button onclick=""showPaths(' + (page - 1) + ')' + '""' + (page <= 1 ? ' disabled' : '') + '>Previous</button>';
-        html += '<span>Page ' + page + ' of ' + data.totalPages + '</span>';
-        html += '<button onclick=""showPaths(' + (page + 1) + ')' + '""' + (page >= data.totalPages ? ' disabled' : '') + '>Next</button>';
-        html += '</div>';
-        content.innerHTML = html;
-    } catch (err) {
-        content.innerHTML = '<p class=""error-text"">Error: ' + err.message + '</p>';
-    }
+page = page || 1;
+const modal = document.getElementById('pathsModal');
+modal.classList.add('show');
+const content = document.getElementById('pathsContent');
+content.innerHTML = '<p class=""centered"">Loading...</p>';
+try {
+const res = await fetch('/api/paths/' + WIPE_ID + '?page=' + page);
+if (!res.ok) throw new Error('Failed to load paths');
+const data = await res.json();
+let html = '<p style=""margin-bottom:10px;"">Total: ' + data.total + ' paths</p>';
+html += '<table class=""data-table""><thead><tr><th>Name</th><th>Spline</th><th>Width</th><th>Nodes</th></tr></thead><tbody>';
+data.paths.forEach(function(p) { html += '<tr><td>' + (p.name || 'Unnamed') + '</td><td>' + (p.spline ? 'Yes' : 'No') + '</td><td>' + (p.width ? p.width.toFixed(2) : 'N/A') + '</td><td>' + p.nodes + '</td></tr>'; });
+html += '</tbody></table>';
+html += '<div class=""pagination"">';
+html += '<button onclick=""showPaths(' + (page - 1) + ')' + '""' + (page <= 1 ? ' disabled' : '') + '>Previous</button>';
+html += '<span>Page ' + page + ' of ' + data.totalPages + '</span>';
+html += '<button onclick=""showPaths(' + (page + 1) + ')' + '""' + (page >= data.totalPages ? ' disabled' : '') + '>Next</button>';
+html += '</div>';
+content.innerHTML = html;
+} catch (err) {content.innerHTML = '<p class=""error-text"">Error: ' + err.message + '</p>';}
 }
-
 async function showPrefabs(category, page) {
-    category = category || 'all';
-    page = page || 1;
-    currentPrefabCategory = category;
-    const modal = document.getElementById('prefabsModal');
-    modal.classList.add('show');
-    const filterBar = document.getElementById('prefabsFilterBar');
-    const content = document.getElementById('prefabsContent');
-    content.innerHTML = '<p class=""centered"">Loading...</p>';
-
-    const res = await fetch('/api/server/' + WIPE_ID);
-    const serverData = await res.json();
-    const mapInfo = serverData.mapInfo || {};
-
-    let filterHtml = '<span class=""badge badge-info clickable' + (category === 'all' ? ' active' : '') + '"" onclick=""showPrefabs(\'all\', 1)"">All</span>';
-    if (mapInfo.prefabCategories) {
-        mapInfo.prefabCategories.forEach(function(cat) {
-            const count = mapInfo.prefabCategoryCounts[cat] || 0;
-            filterHtml += '<span class=""badge badge-info clickable' + (category === cat ? ' active' : '') + '"" onclick=""showPrefabs(\'' + cat + '\', 1)"">' + cat + ' (' + count + ')</span>';
-        });
-    }
-    filterBar.innerHTML = filterHtml;
-
-    try {
-        const catParam = category !== 'all' ? '&category=' + encodeURIComponent(category) : '';
-        const res2 = await fetch('/api/prefabs/' + WIPE_ID + '?page=' + page + catParam);
-        if (!res2.ok) throw new Error('Failed to load prefabs');
-        const data = await res2.json();
-        let html = '<p style=""margin-bottom:10px;"">Showing ' + data.prefabs.length + ' of ' + data.total + ' prefabs';
-        if (category !== 'all') html += ' (filtered by: ' + category + ')';
-        html += '</p>';
-        html += '<table class=""data-table""><thead><tr><th>Category</th><th>ID</th><th>Name</th><th>Position</th></tr></thead><tbody>';
-        data.prefabs.forEach(function(p) { html += '<tr><td>' + p.category + '</td><td>' + p.id + '</td><td>' + (p.name || 'Unknown') + '</td><td class=""pos-cell"">' + p.position + '</td></tr>'; });
-        html += '</tbody></table>';
-        html += '<div class=""pagination"">';
-        html += '<button onclick=""showPrefabs(\'' + category + '\', ' + (page - 1) + ')' + '""' + (page <= 1 ? ' disabled' : '') + '>Previous</button>';
-        html += '<span>Page ' + page + ' of ' + data.totalPages + '</span>';
-        html += '<button onclick=""showPrefabs(\'' + category + '\', ' + (page + 1) + ')' + '""' + (page >= data.totalPages ? ' disabled' : '') + '>Next</button>';
-        html += '</div>';
-        content.innerHTML = html;
-    } catch (err) {
-        content.innerHTML = '<p class=""error-text"">Error: ' + err.message + '</p>';
-    }
+category = category || 'all';
+page = page || 1;
+currentPrefabCategory = category;
+const modal = document.getElementById('prefabsModal');
+modal.classList.add('show');
+const filterBar = document.getElementById('prefabsFilterBar');
+const content = document.getElementById('prefabsContent');
+content.innerHTML = '<p class=""centered"">Loading...</p>';
+const res = await fetch('/api/server/' + WIPE_ID);
+const serverData = await res.json();
+const mapInfo = serverData.mapInfo || {};
+let filterHtml = '<span class=""badge badge-info clickable' + (category === 'all' ? ' active' : '') + '"" onclick=""showPrefabs(\'all\', 1)"">All</span>';
+if (mapInfo.prefabCategories) {
+mapInfo.prefabCategories.forEach(function(cat) {
+const count = mapInfo.prefabCategoryCounts[cat] || 0;
+filterHtml += '<span class=""badge badge-info clickable' + (category === cat ? ' active' : '') + '"" onclick=""showPrefabs(\'' + cat + '\', 1)"">' + cat + ' (' + count + ')</span>';
+});
 }
-
+filterBar.innerHTML = filterHtml;
+try {
+const catParam = category !== 'all' ? '&category=' + encodeURIComponent(category) : '';
+const res2 = await fetch('/api/prefabs/' + WIPE_ID + '?page=' + page + catParam);
+if (!res2.ok) throw new Error('Failed to load prefabs');
+const data = await res2.json();
+let html = '<p style=""margin-bottom:10px;"">Showing ' + data.prefabs.length + ' of ' + data.total + ' prefabs';
+if (category !== 'all') html += ' (filtered by: ' + category + ')';
+html += '</p>';
+html += '<table class=""data-table""><thead><tr><th>Category</th><th>ID</th><th>Name</th><th>Position</th></tr></thead><tbody>';
+data.prefabs.forEach(function(p) { html += '<tr><td>' + p.category + '</td><td>' + p.id + '</td><td>' + (p.name || 'Unknown') + '</td><td class=""pos-cell"">' + p.position + '</td></tr>'; });
+html += '</tbody></table>';
+html += '<div class=""pagination"">';
+html += '<button onclick=""showPrefabs(\'' + category + '\', ' + (page - 1) + ')' + '""' + (page <= 1 ? ' disabled' : '') + '>Previous</button>';
+html += '<span>Page ' + page + ' of ' + data.totalPages + '</span>';
+html += '<button onclick=""showPrefabs(\'' + category + '\', ' + (page + 1) + ')' + '""' + (page >= data.totalPages ? ' disabled' : '') + '>Next</button>';
+html += '</div>';
+content.innerHTML = html;
+} catch (err) {content.innerHTML = '<p class=""error-text"">Error: ' + err.message + '</p>';}
+}
 async function downloadMapLayer(layerName) {
-    try {
-        const res = await fetch('/api/mapdata/' + WIPE_ID + '/' + encodeURIComponent(layerName));
-        if (!res.ok) throw new Error('Failed to download map layer');
-        const data = await res.json();
-        const bytes = atob(data.data);
-        const buffer = new ArrayBuffer(bytes.length);
-        const arr = new Uint8Array(buffer);
-        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-        const blob = new Blob([buffer]);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = layerName + '.bin';
-        a.click();
-        URL.revokeObjectURL(url);
-    } catch (err) { alert('Error downloading: ' + err.message); }
+try {
+const res = await fetch('/api/mapdata/' + WIPE_ID + '/' + encodeURIComponent(layerName));
+if (!res.ok) throw new Error('Failed to download map layer');
+const data = await res.json();
+const bytes = atob(data.data);
+const buffer = new ArrayBuffer(bytes.length);
+const arr = new Uint8Array(buffer);
+for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+const blob = new Blob([buffer]);
+const url = URL.createObjectURL(blob);
+const a = document.createElement('a');
+a.href = url;
+a.download = layerName + '.bin';
+a.click();
+URL.revokeObjectURL(url);
+} catch (err) { alert('Error downloading: ' + err.message); }
 }
-
-function downloadFile(filename, fileType) {
-    window.location.href = '/api/download/' + WIPE_ID + '/' + fileType + '/' + encodeURIComponent(filename);
-}
-
+function downloadFile(filename, fileType) {window.location.href = '/api/download/' + WIPE_ID + '/' + fileType + '/' + encodeURIComponent(filename);}
 loadServerDetail();
 ";
         }
-
         public static string GenerateIndexHtml(bool isAuthenticated)
         {
             string html;
@@ -6532,6 +5814,7 @@ loadServerDetail();
 <meta name=""apple-mobile-web-app-capable"" content=""yes"">
 <meta name=""apple-mobile-web-app-status-bar-style"" content=""black-translucent"">
 <title>Rust Relay Admin</title>
+<link rel=""icon"" type=""image/x-icon"" href=""/favicon.ico"">
 <style>
 " + HtmlStyles.GetBaseStyles() + @"
 </style>
@@ -6574,6 +5857,7 @@ else { document.getElementById('errorMsg').style.display = 'block'; }
 <meta name=""apple-mobile-web-app-capable"" content=""yes"">
 <meta name=""apple-mobile-web-app-status-bar-style"" content=""black-translucent"">
 <title>Rust Relay Admin</title>
+<link rel=""icon"" type=""image/x-icon"" href=""/favicon.ico"">
 <style>
 " + HtmlStyles.GetBaseStyles() + @"
 </style>
@@ -6603,7 +5887,6 @@ const res = await fetch('/api/servers');
 if (res.status === 401) { window.location.reload(); return; }
 const data = await res.json();
 const servers = data.servers || [];
-
 const totalPackets = servers.reduce(function(a, s) { return a + (s.packetsReceived || 0); }, 0);
 const totalBytes = servers.reduce(function(a, s) { return a + (s.bytesReceived || 0); }, 0);
 document.getElementById('stats').innerHTML = '<div class=""stat-box""><div class=""stat-value"">' + servers.length + '</div><div class=""stat-label"">Servers</div></div><div class=""stat-box""><div class=""stat-value"">' + totalPackets.toLocaleString() + '</div><div class=""stat-label"">Total Packets</div></div><div class=""stat-box""><div class=""stat-value"">' + formatBytes(totalBytes) + '</div><div class=""stat-label"">Total Data</div></div>';
