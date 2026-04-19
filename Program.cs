@@ -20,7 +20,6 @@ using System.Text.Json.Serialization;
 using System.Text.Json;
 using System.Buffers;
 using System.Runtime.CompilerServices;
-using System.Diagnostics.CodeAnalysis;
 using System.Net.WebSockets;
 using System.Reflection;
 using UnityEngine;
@@ -51,7 +50,7 @@ namespace RustRelayReceiver
     class Program
     {
         // Configuration
-        public static string Version = "RustRelay9.0 V003";
+        public static string Version = "RustRelay9.0 V004";
         private static string _baseUrl = "http://localhost:8080";
         private static string _authToken = "demotoken";
         private static readonly HttpListener _httpListener = new();
@@ -399,43 +398,47 @@ namespace RustRelayReceiver
                     }
                     if (result.MessageType == WebSocketMessageType.Binary)
                     {
-                        if (result.EndOfMessage == false)
+                        try
                         {
-                            byte[] fragmentCopy = new byte[result.Count];
-                            Buffer.BlockCopy(buffer, 0, fragmentCopy, 0, result.Count);
-                            fragmentBuffer.Add(fragmentCopy);
-                            fragmentTotalLength += result.Count;
-                        }
-                        else
-                        {
-                            byte[] completeData;
-                            if (fragmentBuffer.Count > 0)
+                            if (result.EndOfMessage == false)
                             {
-                                byte[] finalFragment = new byte[result.Count];
-                                Buffer.BlockCopy(buffer, 0, finalFragment, 0, result.Count);
-                                fragmentBuffer.Add(finalFragment);
+                                byte[] fragmentCopy = new byte[result.Count];
+                                Buffer.BlockCopy(buffer, 0, fragmentCopy, 0, result.Count);
+                                fragmentBuffer.Add(fragmentCopy);
                                 fragmentTotalLength += result.Count;
-                                completeData = new byte[fragmentTotalLength];
-                                int destOffset = 0;
-                                foreach (var fragment in fragmentBuffer)
-                                {
-                                    Buffer.BlockCopy(fragment, 0, completeData, destOffset, fragment.Length);
-                                    destOffset += fragment.Length;
-                                }
-                                fragmentBuffer.Clear();
-                                fragmentTotalLength = 0;
                             }
                             else
                             {
-                                completeData = new byte[result.Count];
-                                Buffer.BlockCopy(buffer, 0, completeData, 0, result.Count);
+                                byte[] completeData;
+                                if (fragmentBuffer.Count > 0)
+                                {
+                                    byte[] finalFragment = new byte[result.Count];
+                                    Buffer.BlockCopy(buffer, 0, finalFragment, 0, result.Count);
+                                    fragmentBuffer.Add(finalFragment);
+                                    fragmentTotalLength += result.Count;
+                                    completeData = new byte[fragmentTotalLength];
+                                    int destOffset = 0;
+                                    foreach (var fragment in fragmentBuffer)
+                                    {
+                                        Buffer.BlockCopy(fragment, 0, completeData, destOffset, fragment.Length);
+                                        destOffset += fragment.Length;
+                                    }
+                                    fragmentBuffer.Clear();
+                                    fragmentTotalLength = 0;
+                                }
+                                else
+                                {
+                                    completeData = new byte[result.Count];
+                                    Buffer.BlockCopy(buffer, 0, completeData, 0, result.Count);
+                                }
+                                ProcessBinaryPacket(
+                              completeData.AsSpan(),
+                              completeData.Length,
+                                wipeId
+                            );
                             }
-                            ProcessBinaryPacket(
-                          completeData.AsSpan(),
-                          completeData.Length,
-                            wipeId
-                        );
                         }
+                        catch { }
                     }
                 }
             }
@@ -555,6 +558,10 @@ namespace RustRelayReceiver
                 {
                     await HandleMapDataApi(context);
                 }
+                else if (path.StartsWith("/api/savdata/"))
+                {
+                    await HandleSavDataApi(context);
+                }
                 else if (path.StartsWith("/models/"))
                 {
                     await HandleModels(context);
@@ -575,33 +582,70 @@ namespace RustRelayReceiver
             }
             response.Close();
         }
-
-        private static byte[] GetEntitiesJson(string wipeId, float? cameraX = null, float? cameraY = null, float? cameraZ = null, bool unlimitedView = false)
+        private static byte[] GetEntitiesJson(
+    string wipeId,
+    float? cameraX = null,
+    float? cameraY = null,
+    float? cameraZ = null,
+    bool unlimitedView = false)
         {
-            const float DEFAULT_DISTANCE = 1000f;
+            const float DEFAULT_DISTANCE = 800f;
+            const float ORIGIN_EXCLUDE_RADIUS = 40f;
+            const float ORIGIN_EXCLUDE_RADIUS_SQ = ORIGIN_EXCLUDE_RADIUS * ORIGIN_EXCLUDE_RADIUS;
+
             Dictionary<ulong, (float x, float y, float z)> _entityLastRotation = new();
-            if (!_entitiesByWipe.TryGetValue(wipeId, out var entities)) { return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}"); }
-            _effectsByWipe.TryGetValue(wipeId, out var effects);
+            bool nodata = true;
+
+            if (_entitiesByWipe.TryGetValue(wipeId, out var entities)) nodata = false;
+            if (_effectsByWipe.TryGetValue(wipeId, out var effects)) nodata = false;
+
+            if (nodata)
+                return Encoding.UTF8.GetBytes("{\"timestamp\":0,\"wipeId\":\"\",\"entityCount\":0,\"entities\":[],\"effects\":[]}");
+
             int entityCount = 0;
             int effectCount = 0;
             List<ulong> toRemove = new();
             List<ulong> rotationChangedIds = new();
-            foreach (var entity in entities.Values)
+            if (entities?.Values.Count > 0)
             {
-                entityCount++;
-                if (entity.isDestroyed) toRemove.Add(entity.Id);
-            }
-            foreach (var entity in entities.Values)
-            {
-                if (entity.pos.x == 0 && entity.pos.y == 0 && entity.pos.z == 0) continue;
-                if (_entityLastRotation.TryGetValue(entity.Id, out var lastRot))
+                foreach (var entity in entities.Values)
                 {
-                    if (MathF.Abs(entity.rot.x - lastRot.x) > 0.001f || MathF.Abs(entity.rot.y - lastRot.y) > 0.001f || MathF.Abs(entity.rot.z - lastRot.z) > 0.001f)
-                        rotationChangedIds.Add(entity.Id);
+                    entityCount++;
+                    if (entity.isDestroyed)
+                        toRemove.Add(entity.Id);
                 }
-                else { rotationChangedIds.Add(entity.Id); }
+
+                foreach (var entity in entities.Values)
+                {
+                    float px = entity.pos.x;
+                    float py = entity.pos.y;
+                    float pz = entity.pos.z;
+                    if (px == 0 && py == 0 && pz == 0)
+                        continue;
+                    float originDistSq = px * px + py * py + pz * pz;
+                    if (originDistSq <= ORIGIN_EXCLUDE_RADIUS_SQ)
+                        continue;
+
+                    if (_entityLastRotation.TryGetValue(entity.Id, out var lastRot))
+                    {
+                        if (MathF.Abs(entity.rot.x - lastRot.x) > 0.001f ||
+                            MathF.Abs(entity.rot.y - lastRot.y) > 0.001f ||
+                            MathF.Abs(entity.rot.z - lastRot.z) > 0.001f)
+                        {
+                            rotationChangedIds.Add(entity.Id);
+                        }
+                    }
+                    else
+                    {
+                        rotationChangedIds.Add(entity.Id);
+                    }
+                }
             }
-            if (effects != null) foreach (var effect in effects.Values) effectCount++;
+
+            if (effects != null)
+                foreach (var effect in effects.Values)
+                    effectCount++;
+
             using var stream = new MemoryStream();
             using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false });
             writer.WriteStartObject();
@@ -610,73 +654,101 @@ namespace RustRelayReceiver
             writer.WriteNumber("entityCount", entityCount);
             writer.WriteNumber("effectCount", effectCount);
             writer.WriteStartArray("entities");
-            foreach (var entity in entities.Values)
+
+            if (entities?.Values.Count > 0)
             {
-                if (entity.Parent != 0 && !string.IsNullOrEmpty(entity.Playername) && entities.TryGetValue(entity.Parent, out var parentEntity))
+                foreach (var entity in entities.Values)
                 {
-                    entity.pos.x += parentEntity.pos.x;
-                    entity.pos.y += parentEntity.pos.y;
-                    entity.pos.z += parentEntity.pos.z;
+                    if (entity.Parent != 0 &&
+                        !string.IsNullOrEmpty(entity.Playername) &&
+                        entities.TryGetValue(entity.Parent, out var parentEntity))
+                    {
+                        entity.pos.x += parentEntity.pos.x;
+                        entity.pos.y += parentEntity.pos.y;
+                        entity.pos.z += parentEntity.pos.z;
+                    }
+                    float px = entity.pos.x;
+                    float py = entity.pos.y;
+                    float pz = entity.pos.z;
+                    if (px == 0 && py == 0 && pz == 0)
+                        continue;
+                    float originDistSq = px * px + py * py + pz * pz;
+                    if (originDistSq <= ORIGIN_EXCLUDE_RADIUS_SQ)
+                        continue;
+                    if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
+                    {
+                        float dx = px - cameraX.Value;
+                        float dz = pz - cameraZ.Value;
+                        if ((dx * dx + dz * dz) > (DEFAULT_DISTANCE * DEFAULT_DISTANCE))
+                            continue;
+                    }
+                    bool hasRotationChange = rotationChangedIds.Contains(entity.Id);
+                    writer.WriteStartObject();
+                    writer.WriteNumber("id", entity.Id);
+                    writer.WriteNumber("prefabId", entity.PrefabId);
+                    writer.WriteString("prefabName", entity.PrefabName ?? "");
+                    writer.WriteNumber("groupId", entity.GroupId);
+                    writer.WriteStartObject("pos");
+                    writer.WriteNumber("x", px);
+                    writer.WriteNumber("y", py);
+                    writer.WriteNumber("z", pz);
+                    writer.WriteEndObject();
+                    writer.WriteStartObject("rot");
+                    writer.WriteNumber("x", entity.rot.x);
+                    writer.WriteNumber("y", entity.rot.y);
+                    writer.WriteNumber("z", entity.rot.z);
+                    writer.WriteEndObject();
+                    writer.WriteNumber("flags", entity.Flags);
+                    writer.WriteBoolean("isdestroyed", entity.isDestroyed);
+                    if (hasRotationChange) writer.WriteNumber("rotUpdated", 1);
+                    writer.WriteString("typeClass", entity.TypeClass ?? "");
+                    if (entity.MaxHealth.HasValue && entity.MaxHealth.Value > 0)
+                        writer.WriteNumber("maxHealth", entity.MaxHealth.Value);
+                    if (!string.IsNullOrEmpty(entity.Playername))
+                        writer.WriteString("playerName", entity.Playername);
+                    if (entity.Health > 0)
+                        writer.WriteNumber("health", entity.Health);
+                    if (entity.OwnerId.HasValue && entity.OwnerId.Value != 0)
+                        writer.WriteNumber("ownerId", entity.OwnerId.Value);
+                    if (entity.Extra != null && entity.Extra.Count > 0)
+                    {
+                        writer.WritePropertyName("extra");
+                        writer.WriteRawValue(JsonSerializer.Serialize(entity.Extra));
+                    }
+
+                    writer.WriteEndObject();
+
+                    _entityLastRotation[entity.Id] = (entity.rot.x, entity.rot.y, entity.rot.z);
                 }
-                if (entity.pos.x == 0 && entity.pos.y == 0 && entity.pos.z == 0) continue;
-                if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
-                {
-                    float dx = entity.pos.x - cameraX.Value, dz = entity.pos.z - cameraZ.Value;
-                    if (MathF.Sqrt(dx * dx + dz * dz) > DEFAULT_DISTANCE) continue;
-                }
-                bool hasRotationChange = rotationChangedIds.Contains(entity.Id);
-                writer.WriteStartObject();
-                writer.WriteNumber("id", entity.Id);
-                writer.WriteNumber("prefabId", entity.PrefabId);
-                writer.WriteString("prefabName", entity.PrefabName ?? "");
-                writer.WriteNumber("groupId", entity.GroupId);
-                writer.WriteStartObject("pos");
-                writer.WriteNumber("x", entity.pos.x);
-                writer.WriteNumber("y", entity.pos.y);
-                writer.WriteNumber("z", entity.pos.z);
-                writer.WriteEndObject();
-                writer.WriteStartObject("rot");
-                writer.WriteNumber("x", entity.rot.x);
-                writer.WriteNumber("y", entity.rot.y);
-                writer.WriteNumber("z", entity.rot.z);
-                writer.WriteEndObject();
-                writer.WriteNumber("flags", entity.Flags);
-                writer.WriteBoolean("isdestroyed", entity.isDestroyed);
-                if (hasRotationChange) writer.WriteNumber("rotUpdated", 1);
-                writer.WriteString("typeClass", entity.TypeClass ?? "");
-                if (entity.MaxHealth.HasValue && entity.MaxHealth.Value > 0) writer.WriteNumber("maxHealth", entity.MaxHealth.Value);
-                if (entity.Durability.HasValue) writer.WriteNumber("durability", entity.Durability.Value);
-                if (entity.MaxDurability.HasValue && entity.MaxDurability.Value > 0) writer.WriteNumber("maxDurability", entity.MaxDurability.Value);
-                if (entity.Ammo.HasValue) writer.WriteNumber("ammo", entity.Ammo.Value);
-                if (entity.MaxAmmo.HasValue) writer.WriteNumber("maxAmmo", entity.MaxAmmo.Value);
-                if (entity.OwnerId.HasValue && entity.OwnerId.Value != 0) writer.WriteNumber("ownerId", entity.OwnerId.Value);
-                if (!string.IsNullOrEmpty(entity.OwnerName)) writer.WriteString("ownerName", entity.OwnerName);
-                if (entity.Extra != null && entity.Extra.Count > 0)
-                {
-                    writer.WritePropertyName("extra");
-                    writer.WriteRawValue(System.Text.Json.JsonSerializer.Serialize(entity.Extra));
-                }
-                writer.WriteEndObject();
-                _entityLastRotation[entity.Id] = (entity.rot.x, entity.rot.y, entity.rot.z);
             }
+
             writer.WriteEndArray();
             writer.WriteStartArray("effects");
+
             if (effects != null)
             {
                 foreach (var effect in effects.Values)
                 {
+                    float px = effect.pos.x;
+                    float py = effect.pos.y;
+                    float pz = effect.pos.z;
+                    float originDistSq = px * px + py * py + pz * pz;
+                    if (originDistSq <= ORIGIN_EXCLUDE_RADIUS_SQ)
+                        continue;
+
                     if (!unlimitedView && cameraX.HasValue && cameraY.HasValue && cameraZ.HasValue)
                     {
-                        float dx = effect.pos.x - cameraX.Value, dz = effect.pos.z - cameraZ.Value;
-                        if (MathF.Sqrt(dx * dx + dz * dz) > DEFAULT_DISTANCE) continue;
+                        float dx = px - cameraX.Value;
+                        float dz = pz - cameraZ.Value;
+                        if ((dx * dx + dz * dz) > (DEFAULT_DISTANCE * DEFAULT_DISTANCE))
+                            continue;
                     }
                     writer.WriteStartObject();
                     writer.WriteNumber("id", effect.Id);
-                    writer.WriteString("prefabName", effect.PrefabName ?? "");
                     writer.WriteStartObject("pos");
-                    writer.WriteNumber("x", effect.pos.x);
-                    writer.WriteNumber("y", effect.pos.y);
-                    writer.WriteNumber("z", effect.pos.z);
+                    writer.WriteNumber("x", px);
+                    writer.WriteNumber("y", py);
+                    writer.WriteNumber("z", pz);
                     writer.WriteEndObject();
                     writer.WriteEndObject();
                 }
@@ -684,181 +756,258 @@ namespace RustRelayReceiver
             writer.WriteEndArray();
             writer.WriteEndObject();
             writer.Flush();
-            foreach (var id in toRemove)
+            if (entities != null)
             {
-                entities.TryRemove(id, out _);
-                _entityLastRotation.Remove(id);
+                foreach (var id in toRemove)
+                {
+                    entities.TryRemove(id, out _);
+                    _entityLastRotation.Remove(id);
+                }
             }
+
             return stream.ToArray();
         }
 
         private static void ProcessBinaryPacket(ReadOnlySpan<byte> buffer, int length, string? wipeId)
         {
-            if (string.IsNullOrEmpty(wipeId)) { return; }
-            Interlocked.Increment(ref _totalPacketsReceived);
-            UpdateServerStats(wipeId, length);
-            if (buffer.Length < 4) { return; }
-            if (buffer.Length == MarkerLength && BinaryPrimitives.TryReadInt32LittleEndian(buffer, out int magic) && magic == MarkerMagic)
+            try
             {
-                long serverTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer[4..]);
-                HandleMarker(wipeId, serverTicks);
-                return;
-            }
-            int offset = 0;
-            if (offset + 1 > buffer.Length) return;
-            byte type = buffer[offset];
-            offset += 1;
-            if (type <= 140) return;
-            type -= 140;
-            switch ((MessageType)type)
-            {
-                case MessageType.GroupEnter:
-                case MessageType.GroupLeave:
+                if (string.IsNullOrEmpty(wipeId)) { return; }
+                Interlocked.Increment(ref _totalPacketsReceived);
+                try { UpdateServerStats(wipeId, length); } catch { }
+                if (buffer.Length < 4) { return; }
+                if (buffer.Length == MarkerLength && BinaryPrimitives.TryReadInt32LittleEndian(buffer, out int magic) && magic == MarkerMagic)
+                {
+                    try { HandleMarker(wipeId, BinaryPrimitives.ReadInt64LittleEndian(buffer[4..])); } catch { }
                     return;
-                case MessageType.Entities:
-                    if (offset + sizeof(uint) > buffer.Length) { return; }
-                    offset += sizeof(uint);
-                    int entityDataLength = buffer.Length - offset;
-                    if (entityDataLength <= 0) { return; }
-                    ReadOnlySpan<byte> entityBytes = buffer[offset..];
-                    var entity = Entity.Deserialize(entityBytes.ToArray());
-                    if (entity != null && entity.baseNetworkable != null)
-                    {
-                        var bn = entity.baseNetworkable;
-                        ulong pid = 0;
-                        if (entity.parent != null)
+                }
+                int offset = 0;
+                if (offset + 1 > buffer.Length) return;
+                byte type = buffer[offset];
+                offset += 1;
+                if (type <= 140) return;
+                type -= 140;
+                ulong entityId = 0;
+                switch ((MessageType)type)
+                {
+                    case MessageType.GroupEnter:
+                    case MessageType.GroupLeave:
+                        return;
+                    case MessageType.Entities:
+                        try
                         {
-                            pid = entity.parent.uid.Value;
-                        }
-                        string pname = entity.basePlayer?.name ?? "";
-                        float h = entity.baseCombat?.health ?? entity?.baseCombat?.health ?? 0f;
-                        var tracked = new TrackedEntity
-                        {
-                            Id = bn.uid.Value,
-                            PrefabId = bn.prefabID,
-                            GroupId = bn.group,
-                            PrefabName = Path.GetFileName(GetStringFromPool(wipeId, bn.prefabID)),
-                            Parent = pid,
-                            Playername = pname,
-                            Health = h,
-                            TypeClass = entity?.GetType().Name,
-                            MaxHealth = entity?.baseCombat?.maxHealth ?? entity?.baseCombat?.maxHealth,
-                        };
-
-                        tracked.Extra ??= new();
-                        if (entity?.basePlayer != null)
-                        {
-                            tracked.Extra["stamina"] = entity.basePlayer.metabolism.heartrate;
-                            tracked.Extra["food"] = entity.basePlayer.metabolism.calories;
-                            tracked.Extra["water"] = entity.basePlayer.metabolism.hydration;
-                        }
-                        else if (entity?.worldItem != null)
-                        {
-                            tracked.Extra["itemID"] = entity.worldItem.item.itemid;
-                            tracked.Extra["stackCount"] = entity.worldItem.item.amount;
-                        }
-                        else if (entity?.buildingBlock != null)
-                        {
-                            tracked.Extra["construction"] = entity.buildingBlock.grade;
-                        }
-                        else if (entity?.baseNPC != null)
-                        {
-                            tracked.Extra["npcClass"] = entity.baseNPC.GetType().Name;
-                        }
-
-                        if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
-                        {
-                            entities[tracked.Id] = tracked;
-                            LogDebug($"[SPAWN] Wipe={wipeId} Prefab={bn.prefabID} NETID={bn.uid.Value}");
-                            OnEntityCreated?.Invoke(tracked, wipeId);
-                        }
-                    }
-                    break;
-                case MessageType.Message:
-                    break;
-                case MessageType.VoiceData:
-                    break;
-                case MessageType.EntityDestroy:
-                    if (offset + sizeof(ulong) + sizeof(byte) > buffer.Length) return;
-                    ulong entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
-                    offset += sizeof(ulong);
-                    offset += sizeof(byte);
-                    if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesDel))
-                    {
-                        if (entitiesDel.TryGetValue(entityId, out var entityDel))
-                        {
-                            entityDel.isDestroyed = true;
-                        }
-                    }
-                    LogDebug($"[DESTROY] Wipe={wipeId} Entity={entityId}");
-                    OnEntityDestroyed?.Invoke(wipeId, entityId);
-                    break;
-                case MessageType.EntityPosition:
-                    int minPositionSize = sizeof(ulong) + (sizeof(float) * 7);
-                    if (offset + minPositionSize > buffer.Length) return;
-                    entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
-                    offset += sizeof(ulong);
-                    float posX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float posY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float posZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float rotX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float rotY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float rotZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    float time = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
-                    offset += sizeof(float);
-                    ulong parentId = 0;
-                    if (offset + sizeof(ulong) <= buffer.Length)
-                    {
-                        parentId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
-                    }
-                    if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesPos) &&
-                        entitiesPos.TryGetValue(entityId, out var entityPos))
-                    {
-                        entityPos.UpdatePosition(posX, posY, posZ, rotX, rotY, rotZ);
-                        OnEntityUpdated?.Invoke(entityPos, wipeId);
-                    }
-                    break;
-                case MessageType.Effect:
-                    if (offset + sizeof(uint) > buffer.Length) { return; }
-                    int effectDataLength = buffer.Length - offset;
-                    if (effectDataLength <= 0) { return; }
-                    ReadOnlySpan<byte> effectBytes = buffer[offset..];
-                    var effect = EffectData.Deserialize(effectBytes.ToArray());
-                    if (effect != null)
-                    {
-                        if (effect.pooledstringid != 0)
-                        {
-                            string? name = Path.GetFileName(GetStringFromPool(wipeId, effect.pooledstringid));
-                            ulong effectId = (ulong)effect.pooledstringid;
-                            var tracked = new TrackedEffect()
+                            if (offset + sizeof(uint) > buffer.Length) { return; }
+                            offset += sizeof(uint);
+                            int entityDataLength = buffer.Length - offset;
+                            if (entityDataLength <= 0) { return; }
+                            ReadOnlySpan<byte> entityBytes = buffer[offset..];
+                            var entity = Entity.Deserialize(entityBytes.ToArray());
+                            if (entity != null && entity.baseNetworkable != null)
                             {
-                                Id = effectId,
-                                pos = effect.origin,
-                                PrefabName = name
-                            };
-                            var effects = _effectsByWipe.GetOrAdd(wipeId, _ => new ConcurrentDictionary<ulong, TrackedEffect>());
-                            effects[effectId] = tracked;
-                            LogDebug($"[EFFECT] Wipe={wipeId} Added ID={effectId} Name={name}");
-                            OnEffectDecoded?.Invoke(effect, wipeId);
+                                var bn = entity.baseNetworkable;
+                                ulong pid = 0;
+                                try
+                                {
+                                    if (entity.parent != null)
+                                    {
+                                        pid = entity.parent.uid.Value;
+                                    }
+                                }
+                                catch { pid = 0; }
+                                string pname = "";
+                                try { pname = entity.basePlayer?.name ?? ""; } catch { }
+                                float h = 0f;
+                                try { h = entity.baseCombat?.health ?? 0f; } catch { }
+                                var tracked = new TrackedEntity
+                                {
+                                    Id = bn.uid.Value,
+                                    PrefabId = bn.prefabID,
+                                    GroupId = bn.group,
+                                    PrefabName = "",
+                                    Parent = pid,
+                                    Playername = pname,
+                                    Health = h,
+                                    TypeClass = "",
+                                    MaxHealth = 0,
+                                };
+                                try
+                                {
+                                    tracked.PrefabName = Path.GetFileName(GetStringFromPool(wipeId, bn.prefabID) ?? "");
+                                }
+                                catch { }
+                                try
+                                {
+                                    tracked.TypeClass = entity?.GetType().Name ?? "";
+                                }
+                                catch { }
+                                try
+                                {
+                                    tracked.MaxHealth = entity?.baseCombat?.maxHealth ?? 0;
+                                }
+                                catch { }
+                                tracked.Extra ??= new();
+                                try
+                                {
+                                    if (entity?.basePlayer != null && entity.basePlayer.metabolism != null)
+                                    {
+                                        tracked.Extra["stamina"] = entity.basePlayer.metabolism.heartrate;
+                                        tracked.Extra["food"] = entity.basePlayer.metabolism.calories;
+                                        tracked.Extra["water"] = entity.basePlayer.metabolism.hydration;
+                                    }
+                                    else if (entity?.worldItem != null && entity.worldItem.item != null)
+                                    {
+                                        tracked.Extra["itemID"] = entity.worldItem.item.itemid;
+                                        tracked.Extra["stackCount"] = entity.worldItem.item.amount;
+                                    }
+                                    else if (entity?.buildingBlock != null)
+                                    {
+                                        tracked.Extra["construction"] = entity.buildingBlock.grade;
+                                    }
+                                    else if (entity?.baseNPC != null)
+                                    {
+                                        tracked.Extra["npcClass"] = entity.baseNPC.GetType().Name;
+                                    }
+                                }
+                                catch { }
+                                if (_entitiesByWipe.TryGetValue(wipeId, out var entities))
+                                {
+                                    entities[tracked.Id] = tracked;
+                                    try { LogDebug($"[SPAWN] Wipe={wipeId} Prefab={bn.prefabID} NETID={bn.uid.Value}"); } catch { }
+                                    try { OnEntityCreated?.Invoke(tracked, wipeId); } catch { }
+                                }
+                            }
                         }
-                    }
-                    break;
-                case MessageType.RPCMessage:
-                    if (offset + sizeof(ulong) + sizeof(uint) > buffer.Length) { return; }
-                    entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
-                    offset += sizeof(ulong);
-                    uint rpcId = BinaryPrimitives.ReadUInt32LittleEndian(buffer[offset..]);
-                    LogDebug($"[RPC] Wipe={wipeId} Entity={entityId} RPC={rpcId}");
-                    OnRPCReceived?.Invoke(wipeId, entityId, rpcId);
-                    break;
+                        catch (Exception ex)
+                        {
+                            try { LogDebug($"[Entities] Error: {ex.Message}"); } catch { }
+                        }
+                        break;
+                    case MessageType.Message:
+                        break;
+                    case MessageType.VoiceData:
+                        break;
+                    case MessageType.EntityDestroy:
+                        try
+                        {
+                            if (offset + sizeof(ulong) + sizeof(byte) > buffer.Length) { return; }
+                            entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                            offset += sizeof(ulong);
+                            offset += sizeof(byte);
+                            if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesDel))
+                            {
+                                if (entitiesDel.TryGetValue(entityId, out var entityDel))
+                                {
+                                    entityDel.isDestroyed = true;
+                                }
+                            }
+                            try { LogDebug($"[DESTROY] Wipe={wipeId} Entity={entityId}"); } catch { }
+                            try { OnEntityDestroyed?.Invoke(wipeId, entityId); } catch { }
+                        }
+                        catch (Exception ex)
+                        {
+                            try { LogDebug($"[EntityDestroy] Error: {ex.Message}"); } catch { }
+                        }
+                        break;
+                    case MessageType.EntityPosition:
+                        try
+                        {
+                            int minPositionSize = sizeof(ulong) + (sizeof(float) * 7);
+                            if (offset + minPositionSize > buffer.Length) return;
+                            entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                            offset += sizeof(ulong);
+                            float posX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float posY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float posZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float rotX = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float rotY = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float rotZ = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            float time = BinaryPrimitives.ReadSingleLittleEndian(buffer[offset..]);
+                            offset += sizeof(float);
+                            ulong parentId = 0;
+                            if (offset + sizeof(ulong) <= buffer.Length)
+                            {
+                                parentId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                            }
+                            if (_entitiesByWipe.TryGetValue(wipeId, out var entitiesPos) &&
+                                entitiesPos.TryGetValue(entityId, out var entityPos))
+                            {
+                                entityPos.UpdatePosition(posX, posY, posZ, rotX, rotY, rotZ);
+                                try { OnEntityUpdated?.Invoke(entityPos, wipeId); } catch { }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            try { LogDebug($"[EntityPosition] Error: {ex.Message}"); } catch { }
+                        }
+                        break;
+                    case MessageType.Effect:
+                        try
+                        {
+                            if (offset + sizeof(uint) > buffer.Length) { return; }
+                            int effectDataLength = buffer.Length - offset;
+                            if (effectDataLength <= 0) { return; }
+                            ReadOnlySpan<byte> effectBytes = buffer[offset..];
+                            var effect = EffectData.Deserialize(effectBytes.ToArray());
+                            if (effect != null && effect.pooledstringid != 0)
+                            {
+                                string? name = "";
+                                try { name = Path.GetFileName(GetStringFromPool(wipeId, effect.pooledstringid) ?? ""); } catch { }
+                                ulong effectId = (ulong)effect.pooledstringid;
+                                var tracked = new TrackedEffect()
+                                {
+                                    Id = effectId,
+                                    pos = effect.origin,
+                                    PrefabName = name
+                                };
+                                var effects = _effectsByWipe.GetOrAdd(wipeId, _ => new ConcurrentDictionary<ulong, TrackedEffect>());
+                                effects[effectId] = tracked;
+                                try { LogDebug($"[EFFECT] Wipe={wipeId} Added ID={effectId} Name={name}"); } catch { }
+                                try { OnEffectDecoded?.Invoke(effect, wipeId); } catch { }
+                                try
+                                {
+                                    Task.Run(async () =>
+                                    {
+                                        await Task.Delay(1000);
+                                        if (wipeId != null && _effectsByWipe.TryGetValue(wipeId, out var wipeEffects)){wipeEffects.TryRemove(effectId, out _);                                        }
+                                    });
+                                }
+                                catch { }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            try { LogDebug($"[Effect] Error: {ex.Message}"); } catch { }
+                        }
+                        break;
+                    case MessageType.RPCMessage:
+                        try
+                        {
+                            if (offset + sizeof(ulong) + sizeof(uint) > buffer.Length) { return; }
+                            entityId = BinaryPrimitives.ReadUInt64LittleEndian(buffer[offset..]);
+                            offset += sizeof(ulong);
+                            uint rpcId = BinaryPrimitives.ReadUInt32LittleEndian(buffer[offset..]);
+                            try { LogDebug($"[RPC] Wipe={wipeId} Entity={entityId} RPC={rpcId}"); } catch { }
+                            try { OnRPCReceived?.Invoke(wipeId, entityId, rpcId); } catch { }
+                        }
+                        catch (Exception ex)
+                        {
+                            try { LogDebug($"[RPC] Error: {ex.Message}"); } catch { }
+                        }
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                try { LogDebug($"[ProcessBinaryPacket] Error: {ex.Message}"); } catch { }
             }
         }
+
         private static async Task HandleModels(HttpListenerContext ctx)
         {
             if (ctx.Request.Url == null) { return; }
@@ -1146,6 +1295,48 @@ namespace RustRelayReceiver
                 await SendJsonResponse(response, 500, new { error = ex.Message });
             }
         }
+        private static async Task HandleSavDataApi(HttpListenerContext context)
+        {
+            var request = context.Request;
+            var response = context.Response;
+            if (!HasAuth(context)) { return; }
+            try
+            {
+                string wipeId = request.Url!.AbsolutePath.Replace("/api/savdata/", "");
+                string? nameFilter = request.QueryString["name"];
+                string savDir = Path.Combine(DataDirectory, wipeId, "Snapshots");
+                if (!Directory.Exists(savDir))
+                {
+                    await SendJsonResponse(response, 404, new { error = "Snapshot directory not found" });
+                    return;
+                }
+                string? savFile = Directory
+                    .EnumerateFiles(savDir, "*.sav")
+                    .OrderByDescending(File.GetLastWriteTimeUtc)
+                    .FirstOrDefault();
+
+                if (savFile == null)
+                {
+                    await SendJsonResponse(response, 404, new { error = "No save files found" });
+                    return;
+                }
+                LogDebug($"[SavAPI] wipe={wipeId} file={Path.GetFileName(savFile)} filter={nameFilter}");
+                var entities = ReadSavFile(wipeId, savFile, nameFilter);
+                await SendJsonResponse(response, 200, new
+                {
+                    wipeId,
+                    file = Path.GetFileName(savFile),
+                    filter = nameFilter,
+                    count = entities.Count,
+                    entities
+                });
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"[SAVDATA API] Error: {ex}");
+                await SendJsonResponse(response, 500, new { error = ex.Message });
+            }
+        }
         private static async Task HandleFileDownload(HttpListenerContext context)
         {
             var request = context.Request;
@@ -1233,7 +1424,7 @@ namespace RustRelayReceiver
                 response.ContentType = "application/json";
                 using (var ms = new MemoryStream())
                 {
-                    using (var gzip = new GZipStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+                    using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
                     {
                         gzip.Write(jsonBytes, 0, jsonBytes.Length);
                     }
@@ -1290,7 +1481,7 @@ namespace RustRelayReceiver
                 response.ContentType = "application/json";
                 using (var ms = new MemoryStream())
                 {
-                    using (var gzip = new GZipStream(ms, CompressionLevel.Optimal, leaveOpen: true))
+                    using (var gzip = new GZipStream(ms, CompressionLevel.SmallestSize, leaveOpen: true))
                     {
                         gzip.Write(jsonBytes, 0, jsonBytes.Length);
                     }
@@ -1508,7 +1699,7 @@ namespace RustRelayReceiver
                     }
                     compressedBytes = ms.ToArray();
                 }
-                _mapDataCache[wipeId] = (compressedBytes, latestMapFile.Length);
+                _mapDataCache[wipeId] = (compressedBytes, DateTime.UtcNow.Ticks);
                 SafeWrite(response, compressedBytes, "application/json");
             }
             catch (Exception ex)
@@ -2042,7 +2233,7 @@ namespace RustRelayReceiver
             if (data == null || data.Length == 0) { return string.Empty; }
             using (var outputStream = new MemoryStream())
             {
-                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.Optimal, true)) { gZipStream.Write(data, 0, data.Length); }
+                using (var gZipStream = new GZipStream(outputStream, System.IO.Compression.CompressionLevel.Optimal, true)) { gZipStream.Write(data, 0, data.Length); gZipStream.Flush(); }
                 return Convert.ToBase64String(outputStream.GetBuffer(), 0, (int)outputStream.Length);
             }
         }
@@ -2137,6 +2328,184 @@ namespace RustRelayReceiver
             }
             catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Map file: {ex.Message}"); }
         }
+        private static List<TrackedEntity> ReadSavFileEnts(string wipeId, string filePath)
+        {
+            var result = new List<TrackedEntity>();
+            using var fs = File.OpenRead(filePath);
+            using var br = new BinaryReader(fs);
+            if (br.ReadSByte() != 'S' ||
+                br.ReadSByte() != 'A' ||
+                br.ReadSByte() != 'V' ||
+                br.ReadSByte() != 'R')
+                throw new Exception("Invalid SAV header");
+            if (br.PeekChar() == 'J')
+            {
+                br.ReadChar();
+                _ = br.ReadString();
+            }
+            if (br.PeekChar() == 'D')
+            {
+                br.ReadChar();
+                _ = br.ReadInt32();
+            }
+            _ = br.ReadUInt32();
+            while (fs.Position < fs.Length)
+            {
+                uint size = br.ReadUInt32();
+                long start = fs.Position;
+                var entity = Facepunch.Pool.Get<ProtoBuf.Entity>();
+                try
+                {
+                    entity.ReadFromStream(fs, (int)size, false);
+                    if (entity.baseNetworkable == null)
+                    { continue; }
+                    if (entity.basePlayer == null && entity.ownerInfo == null && entity.buildingBlock == null && entity.storageBox == null && entity.buildingPrivilege == null && entity.baseVehicle == null)
+                    { continue; }
+                    result.Add(BuildTrackedEntity(wipeId, entity));
+                }
+                catch
+                {
+                    fs.Position = start + size;
+                }
+                finally
+                {
+                    entity.Dispose();
+                }
+            }
+            return result;
+        }
+        private static TrackedEntity BuildTrackedEntity(string wipeId,ProtoBuf.Entity entity)
+        {
+            var bn = entity.baseNetworkable;
+            var tracked = new TrackedEntity
+            {
+                Id = bn.uid.Value,
+                PrefabId = bn.prefabID,
+                GroupId = bn.group,
+                Parent = entity.parent?.uid.Value ?? 0,
+                Playername = entity.basePlayer?.name ?? "",
+                Health = entity.baseCombat?.health ?? 0f,
+                MaxHealth = entity.baseCombat?.maxHealth,
+                TypeClass = entity.GetType().Name,
+                OwnerId = entity.ownerInfo?.steamid,
+                Extra = new Dictionary<string, object>()
+            };
+            try
+            {
+                tracked.PrefabName = Path.GetFileName(
+                    GetStringFromPool(wipeId, bn.prefabID) ?? ""
+                );
+            }
+            catch { }
+            try
+            {
+                var p = entity.baseEntity?.pos;
+                var r = entity.baseEntity?.rot;
+
+                if (p != null && r != null)
+                {
+                    tracked.UpdatePosition(
+                        p.Value.x, p.Value.y, p.Value.z,
+                        r.Value.x, r.Value.y, r.Value.z
+                    );
+                }
+            }
+            catch { }
+            try
+            {
+                tracked.UpdateFlags(entity.baseEntity?.flags ?? 0);
+            }
+            catch { }
+            try
+            {
+                if (entity.basePlayer != null)
+                {
+                    tracked.Extra["stamina"] = entity.basePlayer.metabolism.heartrate;
+                    tracked.Extra["food"] = entity.basePlayer.metabolism.calories;
+                    tracked.Extra["water"] = entity.basePlayer.metabolism.hydration;
+                }
+                else if (entity.worldItem != null)
+                {
+                    tracked.Extra["itemID"] = entity.worldItem.item.itemid;
+                    tracked.Extra["stackCount"] = entity.worldItem.item.amount;
+                }
+                else if (entity.buildingBlock != null)
+                {
+                    tracked.Extra["construction"] = entity.buildingBlock.grade;
+                }
+                else if (entity.baseNPC != null)
+                {
+                    tracked.Extra["npcClass"] = entity.baseNPC.GetType().Name;
+                }
+            }
+            catch { }
+            return tracked;
+        }
+        private static List<SavEntityDto> ReadSavFile(string WipeID, string file, string? nameFilter)
+        {
+            var result = new List<SavEntityDto>();
+            string? filter = string.IsNullOrWhiteSpace(nameFilter)? null: nameFilter.ToLowerInvariant();
+             using var fs = File.OpenRead(file);
+            using var br = new BinaryReader(fs);
+            if (br.ReadSByte() != 'S' ||
+                br.ReadSByte() != 'A' ||
+                br.ReadSByte() != 'V' ||
+                br.ReadSByte() != 'R')
+                throw new Exception("Invalid SAV header");
+            if (br.PeekChar() == 'J')
+            {
+                br.ReadChar();
+                _ = br.ReadString();
+            }
+            if (br.PeekChar() == 'D')
+            {
+                br.ReadChar();
+                _ = br.ReadInt32();
+            }
+            _ = br.ReadUInt32();
+            while (fs.Position < fs.Length)
+            {
+                uint size = br.ReadUInt32();
+                long start = fs.Position;
+                var ent = Facepunch.Pool.Get<ProtoBuf.Entity>();
+                try
+                {
+                    ent.ReadFromStream(fs, (int)size, false);
+                    uint prefabId = ent.baseNetworkable?.prefabID ?? 0;
+                    string? prefab = GetStringFromPool(WipeID, prefabId);
+                    if (filter != null && !string.IsNullOrEmpty(prefab) && !prefab.Contains(filter, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ent.Dispose();
+                        continue;
+                    }
+                    result.Add(new SavEntityDto
+                    {
+                        Uid = ent.baseNetworkable?.uid.Value ?? 0,
+                        PrefabId = prefabId,
+                        Prefab = prefab,
+                        Px = ent.baseEntity?.pos.x ?? 0,
+                        Py = ent.baseEntity?.pos.y ?? 0,
+                        Pz = ent.baseEntity?.pos.z ?? 0,
+                        Rx = ent.baseEntity?.rot.x ?? 0,
+                        Ry = ent.baseEntity?.rot.y ?? 0,
+                        Rz = ent.baseEntity?.rot.z ?? 0,
+                        OwnerId = ent.ownerInfo?.steamid ?? 0,
+                        SkinId = ent.baseEntity?.skinid ?? 0,
+                        Health = ent.baseCombat?.health ?? 0f,
+                        IsPlayer = ent.basePlayer != null
+                    });
+                }
+                catch
+                {
+                    fs.Position = start + size;
+                }
+                finally
+                {
+                    ent.Dispose();
+                }
+            }
+            return result;
+        }
         private static WorldSerialization? GetCachedWorldSerialization(string? wipeId)
         {
             lock (_mapCacheLock)
@@ -2214,20 +2583,67 @@ namespace RustRelayReceiver
         }
         private static void SaveSnapshotToFile(string? wipeId, byte[] data)
         {
+            if (wipeId == null)
+                return;
+
             try
             {
-                if (wipeId == null) { return; }
                 string snapshotDir = Path.Combine(DataDirectory, wipeId, "Snapshots");
                 Directory.CreateDirectory(snapshotDir);
-                var existingFiles = new DirectoryInfo(snapshotDir).GetFiles("snapshot_*.sav").OrderByDescending(f => f.CreationTimeUtc).ToList();
-                foreach (var oldFile in existingFiles.Skip(3)) { try { oldFile.Delete(); } catch { } }
+                var existingFiles = new DirectoryInfo(snapshotDir)
+                    .GetFiles("snapshot_*.sav")
+                    .OrderByDescending(f => f.CreationTimeUtc)
+                    .Skip(3);
+
+                foreach (var oldFile in existingFiles)
+                {
+                    try { oldFile.Delete(); } catch { }
+                }
+
                 string timestamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmss");
                 string filename = $"snapshot_{timestamp}.sav";
                 string filepath = Path.Combine(snapshotDir, SanitizeFilename(filename));
-                lock (FileWriteLock) { File.WriteAllBytes(filepath, data); }
+                lock (FileWriteLock)
+                {
+                    File.WriteAllBytes(filepath, data);
+                }
                 LogDebug($"[STORAGE] Snapshot saved: {Path.GetFileName(filepath)} ({wipeId})");
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        var trackedEntities = ReadSavFileEnts(wipeId, filepath);
+
+                        var dict = new ConcurrentDictionary<ulong, TrackedEntity>();
+
+                        foreach (var tracked in trackedEntities)
+                        {
+                            dict[tracked.Id] = tracked;
+
+                            try
+                            {
+                                OnEntityCreated?.Invoke(tracked, wipeId);
+                            }
+                            catch { }
+                        }
+                        _entitiesByWipe.AddOrUpdate(
+                            wipeId,
+                            dict,
+                            (_, __) => dict
+                        );
+
+                        LogDebug($"[SNAPSHOT LOAD] Loaded {dict.Count} entities for wipe {wipeId}");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogDebug($"[SNAPSHOT LOAD] Error ({wipeId}): {ex.Message}");
+                    }
+                });
             }
-            catch (Exception ex) { LogDebug($"[STORAGE] Failed to save Snapshot: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                LogDebug($"[STORAGE] Failed to save Snapshot: {ex.Message}");
+            }
         }
         private static string SanitizeFilename(string filename)
         {
@@ -2307,12 +2723,7 @@ namespace RustRelayReceiver
 
         public string? TypeClass { get; set; }
         public float? MaxHealth { get; set; }
-        public float? Durability { get; set; }
-        public float? MaxDurability { get; set; }
-        public int? Ammo { get; set; }
-        public int? MaxAmmo { get; set; }
         public ulong? OwnerId { get; set; }
-        public string? OwnerName { get; set; }
         public Dictionary<string, object>? Extra { get; set; } = new();
 
         public TrackedEntity() { }
@@ -2362,6 +2773,27 @@ namespace RustRelayReceiver
         public string? png { get; set; }
     }
     #endregion
+    public sealed class SavEntityDto
+    {
+        public ulong Uid { get; set; }
+        public string? Prefab { get; set; } = "";
+        public uint PrefabId { get; set; }
+
+        public float Px { get; set; }
+        public float Py { get; set; }
+        public float Pz { get; set; }
+
+        public float Rx { get; set; }
+        public float Ry { get; set; }
+        public float Rz { get; set; }
+
+        public ulong OwnerId { get; set; }
+        public ulong SkinId { get; set; }
+
+        public float Health { get; set; }
+
+        public bool IsPlayer { get; set; }
+    }
     #region Rust.World
     public class WorldSerialization
     {
@@ -2445,7 +2877,7 @@ namespace RustRelayReceiver
             Splat = splat;
             Topology = topology;
         }
-        public static Array2D<Color> output;
+        public Array2D<Color> output;
         public struct Array2D<T>
         {
             private T[] _items;
@@ -2806,151 +3238,8 @@ namespace RustRelayReceiver
         MenuBar,
         MenuHighlight
     }
-    public readonly struct Color : IEquatable<Color>
+    public readonly struct Color
     {
-        public static readonly Color Empty;
-        public static Color Transparent => new Color(KnownColor.Transparent);
-        public static Color AliceBlue => new Color(KnownColor.AliceBlue);
-        public static Color AntiqueWhite => new Color(KnownColor.AntiqueWhite);
-        public static Color Aqua => new Color(KnownColor.Aqua);
-        public static Color Aquamarine => new Color(KnownColor.Aquamarine);
-        public static Color Azure => new Color(KnownColor.Azure);
-        public static Color Beige => new Color(KnownColor.Beige);
-        public static Color Bisque => new Color(KnownColor.Bisque);
-        public static Color Black => new Color(KnownColor.Black);
-        public static Color BlanchedAlmond => new Color(KnownColor.BlanchedAlmond);
-        public static Color Blue => new Color(KnownColor.Blue);
-        public static Color BlueViolet => new Color(KnownColor.BlueViolet);
-        public static Color Brown => new Color(KnownColor.Brown);
-        public static Color BurlyWood => new Color(KnownColor.BurlyWood);
-        public static Color CadetBlue => new Color(KnownColor.CadetBlue);
-        public static Color Chartreuse => new Color(KnownColor.Chartreuse);
-        public static Color Chocolate => new Color(KnownColor.Chocolate);
-        public static Color Coral => new Color(KnownColor.Coral);
-        public static Color CornflowerBlue => new Color(KnownColor.CornflowerBlue);
-        public static Color Cornsilk => new Color(KnownColor.Cornsilk);
-        public static Color Crimson => new Color(KnownColor.Crimson);
-        public static Color Cyan => new Color(KnownColor.Cyan);
-        public static Color DarkBlue => new Color(KnownColor.DarkBlue);
-        public static Color DarkCyan => new Color(KnownColor.DarkCyan);
-        public static Color DarkGoldenrod => new Color(KnownColor.DarkGoldenrod);
-        public static Color DarkGray => new Color(KnownColor.DarkGray);
-        public static Color DarkGreen => new Color(KnownColor.DarkGreen);
-        public static Color DarkKhaki => new Color(KnownColor.DarkKhaki);
-        public static Color DarkMagenta => new Color(KnownColor.DarkMagenta);
-        public static Color DarkOliveGreen => new Color(KnownColor.DarkOliveGreen);
-        public static Color DarkOrange => new Color(KnownColor.DarkOrange);
-        public static Color DarkOrchid => new Color(KnownColor.DarkOrchid);
-        public static Color DarkRed => new Color(KnownColor.DarkRed);
-        public static Color DarkSalmon => new Color(KnownColor.DarkSalmon);
-        public static Color DarkSeaGreen => new Color(KnownColor.DarkSeaGreen);
-        public static Color DarkSlateBlue => new Color(KnownColor.DarkSlateBlue);
-        public static Color DarkSlateGray => new Color(KnownColor.DarkSlateGray);
-        public static Color DarkTurquoise => new Color(KnownColor.DarkTurquoise);
-        public static Color DarkViolet => new Color(KnownColor.DarkViolet);
-        public static Color DeepPink => new Color(KnownColor.DeepPink);
-        public static Color DeepSkyBlue => new Color(KnownColor.DeepSkyBlue);
-        public static Color DimGray => new Color(KnownColor.DimGray);
-        public static Color DodgerBlue => new Color(KnownColor.DodgerBlue);
-        public static Color Firebrick => new Color(KnownColor.Firebrick);
-        public static Color FloralWhite => new Color(KnownColor.FloralWhite);
-        public static Color ForestGreen => new Color(KnownColor.ForestGreen);
-        public static Color Fuchsia => new Color(KnownColor.Fuchsia);
-        public static Color Gainsboro => new Color(KnownColor.Gainsboro);
-        public static Color GhostWhite => new Color(KnownColor.GhostWhite);
-        public static Color Gold => new Color(KnownColor.Gold);
-        public static Color Goldenrod => new Color(KnownColor.Goldenrod);
-        public static Color Gray => new Color(KnownColor.Gray);
-        public static Color Green => new Color(KnownColor.Green);
-        public static Color GreenYellow => new Color(KnownColor.GreenYellow);
-        public static Color Honeydew => new Color(KnownColor.Honeydew);
-        public static Color HotPink => new Color(KnownColor.HotPink);
-        public static Color IndianRed => new Color(KnownColor.IndianRed);
-        public static Color Indigo => new Color(KnownColor.Indigo);
-        public static Color Ivory => new Color(KnownColor.Ivory);
-        public static Color Khaki => new Color(KnownColor.Khaki);
-        public static Color Lavender => new Color(KnownColor.Lavender);
-        public static Color LavenderBlush => new Color(KnownColor.LavenderBlush);
-        public static Color LawnGreen => new Color(KnownColor.LawnGreen);
-        public static Color LemonChiffon => new Color(KnownColor.LemonChiffon);
-        public static Color LightBlue => new Color(KnownColor.LightBlue);
-        public static Color LightCoral => new Color(KnownColor.LightCoral);
-        public static Color LightCyan => new Color(KnownColor.LightCyan);
-        public static Color LightGoldenrodYellow => new Color(KnownColor.LightGoldenrodYellow);
-        public static Color LightGreen => new Color(KnownColor.LightGreen);
-        public static Color LightGray => new Color(KnownColor.LightGray);
-        public static Color LightPink => new Color(KnownColor.LightPink);
-        public static Color LightSalmon => new Color(KnownColor.LightSalmon);
-        public static Color LightSeaGreen => new Color(KnownColor.LightSeaGreen);
-        public static Color LightSkyBlue => new Color(KnownColor.LightSkyBlue);
-        public static Color LightSlateGray => new Color(KnownColor.LightSlateGray);
-        public static Color LightSteelBlue => new Color(KnownColor.LightSteelBlue);
-        public static Color LightYellow => new Color(KnownColor.LightYellow);
-        public static Color Lime => new Color(KnownColor.Lime);
-        public static Color LimeGreen => new Color(KnownColor.LimeGreen);
-        public static Color Linen => new Color(KnownColor.Linen);
-        public static Color Magenta => new Color(KnownColor.Magenta);
-        public static Color Maroon => new Color(KnownColor.Maroon);
-        public static Color MediumAquamarine => new Color(KnownColor.MediumAquamarine);
-        public static Color MediumBlue => new Color(KnownColor.MediumBlue);
-        public static Color MediumOrchid => new Color(KnownColor.MediumOrchid);
-        public static Color MediumPurple => new Color(KnownColor.MediumPurple);
-        public static Color MediumSeaGreen => new Color(KnownColor.MediumSeaGreen);
-        public static Color MediumSlateBlue => new Color(KnownColor.MediumSlateBlue);
-        public static Color MediumSpringGreen => new Color(KnownColor.MediumSpringGreen);
-        public static Color MediumTurquoise => new Color(KnownColor.MediumTurquoise);
-        public static Color MediumVioletRed => new Color(KnownColor.MediumVioletRed);
-        public static Color MidnightBlue => new Color(KnownColor.MidnightBlue);
-        public static Color MintCream => new Color(KnownColor.MintCream);
-        public static Color MistyRose => new Color(KnownColor.MistyRose);
-        public static Color Moccasin => new Color(KnownColor.Moccasin);
-        public static Color NavajoWhite => new Color(KnownColor.NavajoWhite);
-        public static Color Navy => new Color(KnownColor.Navy);
-        public static Color OldLace => new Color(KnownColor.OldLace);
-        public static Color Olive => new Color(KnownColor.Olive);
-        public static Color OliveDrab => new Color(KnownColor.OliveDrab);
-        public static Color Orange => new Color(KnownColor.Orange);
-        public static Color OrangeRed => new Color(KnownColor.OrangeRed);
-        public static Color Orchid => new Color(KnownColor.Orchid);
-        public static Color PaleGoldenrod => new Color(KnownColor.PaleGoldenrod);
-        public static Color PaleGreen => new Color(KnownColor.PaleGreen);
-        public static Color PaleTurquoise => new Color(KnownColor.PaleTurquoise);
-        public static Color PaleVioletRed => new Color(KnownColor.PaleVioletRed);
-        public static Color PapayaWhip => new Color(KnownColor.PapayaWhip);
-        public static Color PeachPuff => new Color(KnownColor.PeachPuff);
-        public static Color Peru => new Color(KnownColor.Peru);
-        public static Color Pink => new Color(KnownColor.Pink);
-        public static Color Plum => new Color(KnownColor.Plum);
-        public static Color PowderBlue => new Color(KnownColor.PowderBlue);
-        public static Color Purple => new Color(KnownColor.Purple);
-        public static Color RebeccaPurple => new Color(KnownColor.RebeccaPurple);
-        public static Color Red => new Color(KnownColor.Red);
-        public static Color RosyBrown => new Color(KnownColor.RosyBrown);
-        public static Color RoyalBlue => new Color(KnownColor.RoyalBlue);
-        public static Color SaddleBrown => new Color(KnownColor.SaddleBrown);
-        public static Color Salmon => new Color(KnownColor.Salmon);
-        public static Color SandyBrown => new Color(KnownColor.SandyBrown);
-        public static Color SeaGreen => new Color(KnownColor.SeaGreen);
-        public static Color SeaShell => new Color(KnownColor.SeaShell);
-        public static Color Sienna => new Color(KnownColor.Sienna);
-        public static Color Silver => new Color(KnownColor.Silver);
-        public static Color SkyBlue => new Color(KnownColor.SkyBlue);
-        public static Color SlateBlue => new Color(KnownColor.SlateBlue);
-        public static Color SlateGray => new Color(KnownColor.SlateGray);
-        public static Color Snow => new Color(KnownColor.Snow);
-        public static Color SpringGreen => new Color(KnownColor.SpringGreen);
-        public static Color SteelBlue => new Color(KnownColor.SteelBlue);
-        public static Color Tan => new Color(KnownColor.Tan);
-        public static Color Teal => new Color(KnownColor.Teal);
-        public static Color Thistle => new Color(KnownColor.Thistle);
-        public static Color Tomato => new Color(KnownColor.Tomato);
-        public static Color Turquoise => new Color(KnownColor.Turquoise);
-        public static Color Violet => new Color(KnownColor.Violet);
-        public static Color Wheat => new Color(KnownColor.Wheat);
-        public static Color White => new Color(KnownColor.White);
-        public static Color WhiteSmoke => new Color(KnownColor.WhiteSmoke);
-        public static Color Yellow => new Color(KnownColor.Yellow);
-        public static Color YellowGreen => new Color(KnownColor.YellowGreen);
         private const short StateKnownColorValid = 0x0001;
         private const short StateARGBValueValid = 0x0002;
         private const short StateValueMask = StateARGBValueValid;
@@ -2964,24 +3253,24 @@ namespace RustRelayReceiver
         internal const uint ARGBRedMask = 0xFFu << ARGBRedShift;
         internal const uint ARGBGreenMask = 0xFFu << ARGBGreenShift;
         internal const uint ARGBBlueMask = 0xFFu << ARGBBlueShift;
-        private readonly string? name;
         private readonly long value;
         private readonly short knownColor;
         private readonly short state;
+
         internal Color(KnownColor knownColor)
         {
             value = 0;
             state = StateKnownColorValid;
-            name = null;
             this.knownColor = unchecked((short)knownColor);
         }
+
         private Color(long value, short state, string? name, KnownColor knownColor)
         {
             this.value = value;
             this.state = state;
-            this.name = name;
             this.knownColor = unchecked((short)knownColor);
         }
+
         public byte R => unchecked((byte)(Value >> ARGBRedShift));
         public byte G => unchecked((byte)(Value >> ARGBGreenShift));
         public byte B => unchecked((byte)(Value >> ARGBBlueShift));
@@ -2995,24 +3284,7 @@ namespace RustRelayReceiver
             var color = Color.FromKnownColor(knownColor);
             return color.IsSystemColor;
         }
-        public string Name
-        {
-            get
-            {
-                if ((state & StateNameValid) != 0)
-                {
-                    Debug.Assert(name != null);
-                    return name;
-                }
-                if (IsKnownColor)
-                {
-                    string tablename = knownColor.ToString();
-                    Debug.Assert(tablename != null, $"Could not find known color '{(KnownColor)knownColor}' in the KnownColorTable");
-                    return tablename;
-                }
-                return value.ToString("x");
-            }
-        }
+
         private long Value
         {
             get
@@ -3022,13 +3294,15 @@ namespace RustRelayReceiver
                 return NotDefinedValue;
             }
         }
+
         private static void CheckByte(int value)
         {
             static void ThrowOutOfByteRange() => throw new ArgumentException();
             if (unchecked((uint)value) > byte.MaxValue) { ThrowOutOfByteRange(); }
         }
+
         private static Color FromArgb(uint argb) => new Color(argb, StateARGBValueValid, null, (KnownColor)0);
-        public static Color FromArgb(int argb) => FromArgb(unchecked((uint)argb));
+
         public static Color FromArgb(int alpha, int red, int green, int blue)
         {
             CheckByte(alpha);
@@ -3042,109 +3316,21 @@ namespace RustRelayReceiver
                 (uint)blue << ARGBBlueShift
             );
         }
-        public static Color FromArgb(int alpha, Color baseColor)
-        {
-            CheckByte(alpha);
-            return FromArgb(
-                (uint)alpha << ARGBAlphaShift |
-                (uint)baseColor.Value & ~ARGBAlphaMask
-            );
-        }
-        public static Color FromArgb(int red, int green, int blue) => FromArgb(byte.MaxValue, red, green, blue);
+
+
         public static Color FromKnownColor(KnownColor color) =>
             color <= 0 || color > KnownColor.RebeccaPurple ? FromName(color.ToString()) : new Color(color);
+
         public static Color FromName(string name)
         {
             return new Color(NotDefinedValue, StateNameValid, name, (KnownColor)0);
         }
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void GetRgbValues(out int r, out int g, out int b)
-        {
-            uint value = (uint)Value;
-            r = (int)(value & ARGBRedMask) >> ARGBRedShift;
-            g = (int)(value & ARGBGreenMask) >> ARGBGreenShift;
-            b = (int)(value & ARGBBlueMask) >> ARGBBlueShift;
-        }
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void MinMaxRgb(out int min, out int max, int r, int g, int b)
-        {
-            if (r > g)
-            {
-                max = r;
-                min = g;
-            }
-            else
-            {
-                max = g;
-                min = r;
-            }
-            if (b > max)
-            {
-                max = b;
-            }
-            else if (b < min)
-            {
-                min = b;
-            }
-        }
-        public float GetBrightness()
-        {
-            GetRgbValues(out int r, out int g, out int b);
-            MinMaxRgb(out int min, out int max, r, g, b);
-            return (max + min) / (byte.MaxValue * 2f);
-        }
-        public float GetHue()
-        {
-            GetRgbValues(out int r, out int g, out int b);
-            if (r == g && g == b)
-                return 0f;
-            MinMaxRgb(out int min, out int max, r, g, b);
-            float delta = max - min;
-            float hue;
-            if (r == max)
-                hue = (g - b) / delta;
-            else if (g == max)
-                hue = (b - r) / delta + 2f;
-            else
-                hue = (r - g) / delta + 4f;
-            hue *= 60f;
-            if (hue < 0f)
-                hue += 360f;
-            return hue;
-        }
-        public float GetSaturation()
-        {
-            GetRgbValues(out int r, out int g, out int b);
-            if (r == g && g == b)
-                return 0f;
-            MinMaxRgb(out int min, out int max, r, g, b);
-            int div = max + min;
-            if (div > byte.MaxValue)
-                div = byte.MaxValue * 2 - max - min;
-            return (max - min) / (float)div;
-        }
+
         public int ToArgb() => unchecked((int)Value);
-        public KnownColor ToKnownColor() => (KnownColor)knownColor;
-        public override string ToString() =>
-            IsNamedColor ? $"{nameof(Color)} [{Name}]" :
-            (state & StateValueMask) != 0 ? $"{nameof(Color)} [A={A}, R={R}, G={G}, B={B}]" :
-            $"{nameof(Color)} [Empty]";
-        public static bool operator ==(Color left, Color right) =>
-            left.value == right.value
-                && left.state == right.state
-                && left.knownColor == right.knownColor
-                && left.name == right.name;
-        public static bool operator !=(Color left, Color right) => !(left == right);
-        public override bool Equals([NotNullWhen(true)] object? obj) => obj is Color other && Equals(other);
-        public bool Equals(Color other) => this == other;
-        public override int GetHashCode()
-        {
-            if (name != null && !IsKnownColor)
-                return name.GetHashCode();
-            return HashCode.Combine(value.GetHashCode(), state.GetHashCode(), knownColor.GetHashCode());
-        }
+   
     }
     #endregion
+
     #region HTML Pages
     public static class HtmlStyles
     {
@@ -3599,11 +3785,13 @@ transition: all 0.2s ease;
     }
     public class HTML
     {
+
         private static string EscapeJavaScriptString(string s)
         {
             if (s == null) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r").Replace("'", "\\'");
         }
+
         public static byte[] GetIndexHtmlBytes(bool isAuthenticated)
         {
             var key = HtmlCache.IndexKey(isAuthenticated);
@@ -3613,6 +3801,7 @@ transition: all 0.2s ease;
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
+
         public static byte[] GetServerDetailHtmlBytes(string wipeId, bool isAuthenticated)
         {
             var key = HtmlCache.ServerDetailKey(wipeId, isAuthenticated);
@@ -3623,6 +3812,7 @@ transition: all 0.2s ease;
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
+
         public static byte[] Get3DViewerHtmlBytes(string wipeId)
         {
             var key = HtmlCache.Viewer3DKey(wipeId);
@@ -3632,6 +3822,7 @@ transition: all 0.2s ease;
             HtmlCache.Set(key, html);
             return System.Text.Encoding.UTF8.GetBytes(html);
         }
+
         public static string Generate3DViewerHtml(string WipeID)
         {
             return @"<!DOCTYPE html>
@@ -3726,6 +3917,7 @@ let showUnlimitedView = true;
 let waterMesh = null;
 let roadInstancer, railInstancer, riverInstancer, cubeInstancer;
 let cubeCount = 0;
+const glbFailedOnce = new Set();
 const MAX_CUBE_PREFABS = 10000;
 const debugEl = document.getElementById('debug-info');
 const ROAD_HEIGHT_OFFSET = 0.5;
@@ -3772,14 +3964,29 @@ if (lower.includes('item') || lower.includes('world')) return { showAmmo: false,
 return defaultConfig;
 }
 const EXPLOSION_TYPES = {
-4089790239: { name: 'Grenade', color: 0xffaa00, size: 3, particles: 20 },
-2253809414: { name: 'Rocket', color: 0xff4400, size: 6, particles: 40 },
-1437504946: { name: 'FireRocket', color: 0xff2200, size: 5, particles: 50 },
-1350996199: { name: 'MLRS', color: 0xffcc00, size: 8, particles: 60 },
-1161374517: { name: 'MLRS', color: 0xffcc00, size: 8, particles: 60 },
-857997843:  { name: 'C4', color: 0xffffff, size: 10, particles: 80 } 
+4089790239: { name: 'F1 Grenade', color: 0xffaa00, size: 10, particles: 20 },
+701725454:  { name: 'Beancan Grenade', color: 0xff9900, size: 12, particles: 25 },
+3152512321: { name: 'Bee Grenade', color: 0xffcc00, size: 12, particles: 30 },
+1872825961: { name: 'Flashbang', color: 0xffffff, size: 8, particles: 15 },
+3053816283: { name: 'Rocket', color: 0xff4400, size: 15, particles: 40 },
+2253809414: { name: 'Rocket HV', color: 0xff3300, size: 16, particles: 45 },
+1437504946: { name: 'Rocket Incendiary', color: 0xff2200, size: 16, particles: 50 },
+3591459072: { name: 'SAM Rocket', color: 0xff5500, size: 18, particles: 50 },
+2513205737: { name: 'MLRS Air', color: 0xffdd00, size: 22, particles: 65 },
+1161374517: { name: 'MLRS Ground', color: 0xffcc00, size: 22, particles: 65 },
+3731256754: { name: 'Molotov', color: 0xff6600, size: 14, particles: 40 },
+4150666752: { name: 'Fire', color: 0xff3300, size: 12, particles: 35 },
+1448730840: { name: 'Gas Canister', color: 0xcccccc, size: 10, particles: 20 },
+1289728008: { name: 'Satchel Charge', color: 0xffffff, size: 18, particles: 70 },
+3028196029: { name: 'Landmine', color: 0xffbb00, size: 16, particles: 55 },
+857997843:  { name: 'C4', color: 0xffffff, size: 18, particles: 80 },
+1798302402: { name: 'Explosive Rifle Bullet', color: 0xff8800, size: 8, particles: 15 },
+3702991035: { name: 'Generic Explosion', color: 0xffaa00, size: 14, particles: 35 },
+1125943349: { name: 'Tube Launch', color: 0xffaa00, size: 10, particles: 20 },
+227359892:  { name: 'Attack Helicopter', color: 0xff5500, size: 25, particles: 90 }
 };
-function isExplosionEffect(entityId) { return !!EFFECT_CONFIGS[entityId];}
+function isExplosionEffect(entityId) { return !!EXPLOSION_TYPES[entityId];}
+function shouldShowEffect(effectId) { return EXPLOSION_TYPES.hasOwnProperty(effectId) || isExplosionEffect(effectId);}
 const BBMarkerConfig = {
 'underwater_lab': { size: [200, 100, 200], type: 'cube', opacity: 0.2 },
 'entrance_bunker': { size: [100, 74, 100], type: 'cube', opacity: 0.2 },
@@ -3862,6 +4069,11 @@ let lastVisibilityUpdate = 0;
 const VISIBILITY_UPDATE_INTERVAL = 150;
 const sharedMarkerMaterial = new THREE.MeshBasicMaterial({ color: 0x00ffff, opacity: 0.9, transparent: true });
 const sharedMarkerGeometry = new THREE.BoxGeometry(3, 3, 3);
+const MAX_CONCURRENT_EXPLOSIONS = 100;
+let activeExplosionCount = 0;
+const activeExplosions = new Set();
+const explosionMaterialsCache = new Map();
+const explosionGeometry = new THREE.SphereGeometry(0.1, 6, 6); 
 function getPooledMarker() {
 if (entityPool.marker.length > 0) {
 return entityPool.marker.pop();
@@ -4120,6 +4332,15 @@ return new THREE.Vector3(x, y, -z);
 function transformRotationFromUnity(rotX, rotY, rotZ) {
 return { x: -rotX, y: -rotY, z: -rotZ };
 }
+function updateLabelDisplay(label) {
+const info = getEntityLabelInfo(label);
+if (label.infoElement) {label.infoElement.textContent = info;}
+if (label.userData.healthPct !== undefined) {
+const pct = label.userData.healthPct;
+label.healthBar.style.width = `${pct * 100}%`;
+label.healthBar.style.backgroundColor = getHealthColor(pct);
+}
+}
 function applyEntityTransform(obj, unityX, unityY, unityZ, unityRotX, unityRotY, unityRotZ, offsets) {
 const normalizedPos = transformPositionFromUnity(unityX || 0, unityY || 0, unityZ || 0);
 const rotOffset = offsets?.rotationOffset ?? offsets?.localRotationOffset ?? { x: 0, y: 0, z: 0 };
@@ -4132,9 +4353,9 @@ const combinedRotX = baseRotX + (rotOffset.x || 0);
 const combinedRotY = baseRotY + (rotOffset.y || 0);
 const combinedRotZ = baseRotZ + (rotOffset.z || 0);
 const normalizedRot = {
-x: -combinedRotX,
+x: combinedRotX,
 y: 180 - combinedRotY,
-z: -combinedRotZ
+z: combinedRotZ
 };
 const normalizedEuler = new THREE.Euler(
 THREE.MathUtils.degToRad(normalizedRot.x),
@@ -4165,23 +4386,174 @@ function addEntityLabel(prefabName, x, y, z, isPlayer = false) {
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
 canvas.width = 512;
-canvas.height = 128;
-ctx.fillStyle = isPlayer ? 'rgba(100, 50, 0, 0.8)' : 'rgba(0, 50, 100, 0.8)';
-ctx.fillRect(0, 0, 512, 128);
+canvas.height = 200;
+ctx.fillStyle = isPlayer ? 'rgba(40, 20, 0, 0.9)' : 'rgba(0, 30, 60, 0.9)';
+ctx.fillRect(0, 0, 512, 200);
+ctx.strokeStyle = isPlayer ? '#ffaa00' : '#00ffff';
+ctx.lineWidth = 3;
+ctx.strokeRect(1, 1, 510, 198);
 ctx.fillStyle = isPlayer ? '#ffaa00' : '#00ffff';
-ctx.font = 'bold 28px Arial';
+ctx.font = 'bold 32px Arial';
 ctx.textAlign = 'center';
-ctx.fillText(prefabName, 256, 64);
+ctx.fillText(prefabName, 256, 42);
+const healthBarY = 60;
+const healthBarHeight = 24;
+const healthBarWidth = 400;
+const healthBarX = (512 - healthBarWidth) / 2;
+ctx.fillStyle = 'rgba(50, 50, 50, 0.8)';
+ctx.fillRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+ctx.fillStyle = '#4CAF50';
+ctx.fillRect(healthBarX, healthBarY, 0, healthBarHeight);
+ctx.strokeStyle = '#ffffff';
+ctx.lineWidth = 2;
+ctx.strokeRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+ctx.fillStyle = '#ffffff';
+ctx.font = 'bold 18px Arial';
+ctx.textAlign = 'center';
+ctx.fillText('HP: --/--', 256, healthBarY + 18);
+ctx.font = '20px Arial';
+ctx.textAlign = 'left';
+const statsStartY = 105;
+const lineHeight = 28;
+if (isPlayer) {
+ctx.textAlign = 'center';
+ctx.fillText('Stamina: --', 256, statsStartY);
+ctx.fillText('Food: --  |  Water: --', 256, statsStartY + lineHeight);
+}
+ctx.textAlign = 'right';
+ctx.fillText('Grade: --', 492, statsStartY);
+ctx.fillText('Stack: --', 492, statsStartY + lineHeight);
 const texture = new THREE.CanvasTexture(canvas);
-const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: true });
+texture.minFilter = THREE.LinearFilter;
+const spriteMat = new THREE.SpriteMaterial({ map: texture, depthTest: false, sizeAttenuation: true, transparent: true });
 const sprite = new THREE.Sprite(spriteMat);
-sprite.position.set(x, y + 5, z);
-sprite.scale.set(12, 3, 1);
+sprite.position.set(x, y + 8, z);
+sprite.scale.set(14, 5.5, 1);
 sprite.visible = showLabels && showEntities;
-sprite.userData.labelOffset = 5;
+sprite.userData.entityName = prefabName;
+sprite.userData.labelOffset = 8;
 sprite.userData.isPlayer = isPlayer;
+sprite.userData.healthPct = 0;
+sprite.userData.health = 0;
+sprite.userData.maxHealth = 0;
+sprite.userData.stamina = null;
+sprite.userData.food = null;
+sprite.userData.water = null;
+sprite.userData.stackCount = null;
+sprite.userData.construction = null;
+sprite.userData.canvas = canvas;
+sprite.userData.ctx = ctx;
 scene.add(sprite);
 return sprite;
+}
+function updateEntityLabelInfo(sprite) {
+if (!sprite || !sprite.userData) return;
+const ud = sprite.userData;
+const canvas = ud.canvas;
+const ctx = ud.ctx;
+const isPlayer = ud.isPlayer;
+if (!canvas || !ctx) return;
+ctx.clearRect(0, 0, canvas.width, canvas.height);
+ctx.fillStyle = isPlayer ? 'rgba(40, 20, 0, 0.9)' : 'rgba(0, 30, 60, 0.9)';
+ctx.fillRect(0, 0, 512, 200);
+ctx.strokeStyle = isPlayer ? '#ffaa00' : '#00ffff';
+ctx.lineWidth = 3;
+ctx.strokeRect(1, 1, 510, 198);
+const name = ud.entityName || 'Entity';
+ctx.fillStyle = isPlayer ? '#ffaa00' : '#00ffff';
+ctx.font = 'bold 32px Arial';
+ctx.textAlign = 'center';
+ctx.fillText(name, 256, 42);
+const healthBarY = 60;
+const healthBarHeight = 24;
+const healthBarWidth = 400;
+const healthBarX = (512 - healthBarWidth) / 2;
+ctx.fillStyle = 'rgba(50, 50, 50, 0.8)';
+ctx.fillRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+const healthPct = Math.max(0, Math.min(1, ud.healthPct || 0));
+let barColor = '#4CAF50';
+if (healthPct <= 0.3) barColor = '#F44336';
+else if (healthPct <= 0.6) barColor = '#FF9800';
+ctx.fillStyle = barColor;
+ctx.fillRect(healthBarX, healthBarY, healthBarWidth * healthPct, healthBarHeight);
+ctx.strokeStyle = '#ffffff';
+ctx.lineWidth = 2;
+ctx.strokeRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+const health = Math.round(ud.health || 0);
+const maxHealth = Math.round(ud.maxHealth || 0);
+ctx.fillStyle = '#ffffff';
+ctx.font = 'bold 18px Arial';
+ctx.textAlign = 'center';
+if (maxHealth > 0) {
+ctx.fillText('HP: ' + health + '/' + maxHealth + ' (' + Math.round(healthPct * 100) + '%)', 256, healthBarY + 18);
+} else if (health > 0) {
+ctx.fillText('HP: ' + health, 256, healthBarY + 18);
+} else {
+ctx.fillText('HP: N/A', 256, healthBarY + 18);
+}
+ctx.font = '20px Arial';
+const statsStartY = 105;
+const lineHeight = 28;
+ctx.textAlign = 'left';
+if (isPlayer) {
+ctx.textAlign = 'center';
+const stamina = ud.stamina !== null && ud.stamina !== undefined ? Math.round(ud.stamina) : '--';
+ctx.fillText('Stamina: ' + stamina, 256, statsStartY);
+const food = ud.food !== null && ud.food !== undefined ? Math.round(ud.food) : '--';
+const water = ud.water !== null && ud.water !== undefined ? Math.round(ud.water) : '--';
+ctx.fillText('Food: ' + food + '  |  Water: ' + water, 256, statsStartY + lineHeight);
+}
+if (ud.construction !== null && ud.construction !== undefined) {
+ctx.textAlign = 'right';
+const gradeNames = ['Twigs', 'Wood', 'Stone', 'Metal', 'HQM'];
+const grade = Math.round(ud.construction);
+const gradeName = grade >= 0 && grade < gradeNames.length ? gradeNames[grade] : 'Grade ' + grade;
+ctx.fillText('Grade: ' + gradeName, 492, statsStartY);
+}
+if (ud.stackCount !== null && ud.stackCount !== undefined) {
+ctx.textAlign = 'right';
+ctx.fillText('Stack: ' + ud.stackCount, 492, statsStartY + lineHeight);
+}
+if (sprite.material.map) {
+sprite.material.map.needsUpdate = true;
+}
+}
+function getEntityLabelInfo(label) {
+if (!label || !label.userData) {return '';}
+const ud = label.userData;
+const lines = [];
+if (ud.maxHealth > 0) {
+const healthNum = Math.round(ud.health || 0);
+const maxHealthNum = Math.round(ud.maxHealth || 0);
+lines.push(`HP: ${healthNum}/${maxHealthNum}`);
+}
+if (ud.stamina !== null && ud.stamina !== undefined) {
+lines.push(`Stamina: ${Math.round(ud.stamina)}`);
+}
+if (ud.food !== null && ud.food !== undefined) {
+lines.push(`Food: ${Math.round(ud.food)}`);
+}
+if (ud.water !== null && ud.water !== undefined) {
+lines.push(`Water: ${Math.round(ud.water)}`);
+}
+if (ud.stackCount !== null && ud.stackCount !== undefined) {
+lines.push(`Stack: ${ud.stackCount}`);
+}
+if (ud.construction !== null && ud.construction !== undefined) {
+const gradeNames = ['Twigs', 'Wood', 'Stone', 'Metal', 'HQM'];
+const grade = Math.round(ud.construction);
+const gradeName = grade >= 0 && grade < gradeNames.length ? gradeNames[grade] : `Grade ${grade}`;
+lines.push(`Grade: ${gradeName}`);
+}
+if (ud.npcClass) {
+lines.push(`Type: ${ud.npcClass}`);
+}
+return lines.join('\n');
+}
+function getHealthColor(pct) {
+if (pct > 0.6) return '#4CAF50';
+if (pct > 0.3) return '#FF9800';
+return '#F44336';
 }
 async function spawnEntity(entityData) {
 const entityId = entityData.id ?? entityData.Id;
@@ -4207,17 +4579,19 @@ const unityRotY = rot.Y !== undefined ? rot.Y : (rot.y !== undefined ? rot.y : (
 const unityRotZ = rot.Z !== undefined ? rot.Z : (rot.z !== undefined ? rot.z : (rot[2] || 0));
 const typeClass = entityData.typeClass || entityData.TypeClass || '';
 const maxHealth = entityData.maxHealth ?? entityData.MaxHealth ?? 0;
-const durability = entityData.durability ?? entityData.Durability ?? 0;
-const maxDurability = entityData.maxDurability ?? entityData.MaxDurability ?? 0;
-const ammo = entityData.ammo ?? entityData.Ammo ?? 0;
-const maxAmmo = entityData.maxAmmo ?? entityData.MaxAmmo ?? 0;
 const ownerId = entityData.ownerId ?? entityData.OwnerId ?? 0;
-const ownerName = entityData.ownerName || entityData.OwnerName || '';
 const playerName = entityData.playerName || entityData.Playername || '';
 const visual = getVisualConfig(typeClass);
-const healthPct = maxHealth > 0 ? Math.min(entityData.health / maxHealth, 1) : 0;
-let ammoText = (visual.showAmmo && maxAmmo > 0) ? `${ammo}/${maxAmmo}` : '';
-let labelName = ownerName || playerName || visual.label || prefabName;
+const healthPct = maxHealth > 0 ? Math.min(entityData.health / maxHealth, 1) : (entityData.health > 0 ? 1 : 0);
+const currentHealth = entityData.health ?? 0;
+let labelName = playerName || visual.label || prefabName;
+const stamina = entityData.extra?.stamina ?? entityData.stamina ?? null;
+const food = entityData.extra?.food ?? entityData.food ?? null;
+const water = entityData.extra?.water ?? entityData.water ?? null;
+const itemId = entityData.extra?.itemID ?? entityData.itemID ?? null;
+const stackCount = entityData.extra?.stackCount ?? entityData.stackCount ?? null;
+const construction = entityData.extra?.construction ?? entityData.construction ?? null;
+const npcClass = entityData.extra?.npcClass ?? entityData.npcClass ?? null;
 const modelUrl = window.location.origin + '/models/' + prefabName + '.glb';
 let offsets;
 try {
@@ -4240,9 +4614,18 @@ entityMeshes.set(entityId, model);
 entitiesById.set(entityId, entityData);
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
 const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
-label.userData.ammo = ammoText;
 label.userData.healthPct = healthPct;
+label.userData.health = currentHealth;
+label.userData.maxHealth = maxHealth;
+label.userData.stamina = stamina;
+label.userData.food = food;
+label.userData.water = water;
+label.userData.stackCount = stackCount;
+label.userData.construction = construction;
+label.userData.npcClass = npcClass;
+label.userData.entityName = labelName;
 entityLabels.set(entityId, label);
+updateEntityLabelInfo(label);
 updateEntityCountDisplay();
 visibilityDirty = true;
 return;
@@ -4261,9 +4644,18 @@ entityMeshes.set(entityId, model);
 entitiesById.set(entityId, entityData);
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
 const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
-label.userData.ammo = ammoText;
 label.userData.healthPct = healthPct;
+label.userData.health = currentHealth;
+label.userData.maxHealth = maxHealth;
+label.userData.stamina = stamina;
+label.userData.food = food;
+label.userData.water = water;
+label.userData.stackCount = stackCount;
+label.userData.construction = construction;
+label.userData.npcClass = npcClass;
+label.userData.entityName = labelName;
 entityLabels.set(entityId, label);
+updateEntityLabelInfo(label);
 updateEntityCountDisplay();
 visibilityDirty = true;
 resolve();
@@ -4277,9 +4669,18 @@ scene.add(marker);
 entityMeshes.set(entityId, marker);
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
 const label = addEntityLabel(labelName, markerPos.x, markerPos.y, markerPos.z, isPlayerEntity);
-label.userData.ammo = ammoText;
 label.userData.healthPct = healthPct;
+label.userData.health = currentHealth;
+label.userData.maxHealth = maxHealth;
+label.userData.stamina = stamina;
+label.userData.food = food;
+label.userData.water = water;
+label.userData.stackCount = stackCount;
+label.userData.construction = construction;
+label.userData.npcClass = npcClass;
+label.userData.entityName = labelName;
 entityLabels.set(entityId, label);
+updateEntityLabelInfo(label);
 entitiesById.set(entityId, entityData);
 updateEntityCountDisplay();
 marker.position.copy(markerPos);
@@ -4317,9 +4718,9 @@ const combinedRotX = unityRotX;
 const combinedRotY = unityRotY;
 const combinedRotZ = unityRotZ;
 const normalizedRot = {
-x: -combinedRotX,
+x: combinedRotX,
 y: 180 - combinedRotY,
-z: -combinedRotZ
+z: combinedRotZ
 };
 const normalizedEuler = new THREE.Euler(
 THREE.MathUtils.degToRad(normalizedRot.x),
@@ -4334,10 +4735,33 @@ quaternion: targetQuat,
 labelOffset: 5
 });
 entitiesById.set(entityId, entityData);
+if (label) {
+const maxHealth = entityData.maxHealth ?? entityData.MaxHealth ?? 0;
+const healthPct = maxHealth > 0 ? Math.min((entityData.health ?? 0) / maxHealth, 1)  : ((entityData.health ?? 0) > 0 ? 1 : 0);
+const stamina = entityData.extra?.stamina ?? entityData.stamina ?? null;
+const food = entityData.extra?.food ?? entityData.food ?? null;
+const water = entityData.extra?.water ?? entityData.water ?? null;
+const stackCount = entityData.extra?.stackCount ?? entityData.stackCount ?? null;
+const construction = entityData.extra?.construction ?? entityData.construction ?? null;
+label.userData.healthPct = healthPct;
+label.userData.health = entityData.health ?? 0;
+label.userData.maxHealth = maxHealth;
+label.userData.stamina = stamina;
+label.userData.food = food;
+label.userData.water = water;
+label.userData.stackCount = stackCount;
+label.userData.construction = construction;
+updateEntityLabelInfo(label);
+}
 visibilityDirty = true;
 }
 function despawnEntity(entityId) {
 const mesh = entityMeshes.get(entityId);
+if (mesh && mesh.userData && mesh.userData.isExplosion) {
+activeExplosions.delete(entityId);
+activeExplosionCount = Math.max(0, activeExplosionCount - 1);
+if (mesh.userData) mesh.userData.expired = true;
+}
 const label = entityLabels.get(entityId);
 if (mesh || entityMeshes.has(entityId)) {
 if (mesh && mesh.userData && mesh.userData.isEntity) {
@@ -4345,15 +4769,15 @@ if (mesh.geometry === sharedMarkerGeometry) {
 returnToPool(mesh);
 } else {
 scene.remove(mesh);
-if (mesh.geometry && mesh.geometry !== sharedMarkerGeometry) mesh.geometry.dispose();
+if (mesh.geometry && mesh.geometry !== sharedMarkerGeometry && mesh.geometry !== explosionGeometry) mesh.geometry.dispose();
 if (mesh.material) {
 if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
-else mesh.material.dispose();
+else if (mesh.material && !mesh.material.isSharedMaterial) mesh.material.dispose();
+}
 }
 }
 }
 entityMeshes.delete(entityId);
-}
 if (label || entityLabels.has(entityId)) {
 if (label) {
 scene.remove(label);
@@ -4407,6 +4831,9 @@ const label = entityLabels.get(entityId);
 if (label) {
 label.visible = showLabels && (isPlayer || distanceToCamera < LABEL_CREATION_DISTANCE);
 }
+} else {
+const label = entityLabels.get(entityId);
+if (label) {label.visible = false;}
 }
 });
 updateVisibleCountDisplay();
@@ -4427,19 +4854,34 @@ log('Loaded ' + entityMeshes.size + ' entities', 'success');
 if (data.effects && Array.isArray(data.effects)) {
 log('Processing ' + data.effects.length + ' effects...', 'info');
 for (const effect of data.effects) {
-await spawnEntity(effect);
+await spawnEffectWithTTL(effect);
 }
 }
 } catch (error) {
 log('Failed to load entities: ' + error.message, 'error');
 }
 }
-function spawnEffectWithTTL(effect, ttlMs = 5000) {
+function getSharedExplosionMaterial(color) {
+if (!explosionMaterialsCache.has(color)) {
+explosionMaterialsCache.set(color, new THREE.MeshBasicMaterial({
+color: color,
+transparent: true,
+opacity: 1
+}));
+}
+return explosionMaterialsCache.get(color);
+}
+function spawnEffectWithTTL(effect, ttlMs = 1000) {
 const effectId = effect.id ?? effect.Id;
 if (!effectId){return;}
+if (entityMeshes.has(effectId)) { return; }
+if (activeExplosionCount >= MAX_CONCURRENT_EXPLOSIONS) {
+const oldestId = activeExplosions.values().next().value;
+if (oldestId) despawnEntity(oldestId);
+}
 if (effectTimers.has(effectId)) {
 clearTimeout(effectTimers.get(effectId));
-despawnEntity(effectId);
+effectTimers.delete(effectId);
 }
 const config = EXPLOSION_TYPES[effectId] || { color: 0xffff00, size: 2, particles: 15 };
 const explosionGroup = createExplosionParticles(config);
@@ -4448,22 +4890,17 @@ const worldPos = transformPositionFromUnity(pos.x, pos.y, pos.z);
 explosionGroup.position.set(worldPos.x, worldPos.y, worldPos.z);
 scene.add(explosionGroup);
 entityMeshes.set(effectId, explosionGroup);
-const timer = setTimeout(() => {
-despawnEntity(effectId);
-}, ttlMs);
+activeExplosions.add(effectId);
+activeExplosionCount++;
+const timer = setTimeout(() => {despawnEntity(effectId);}, ttlMs);
 effectTimers.set(effectId, timer);
 }
 function createExplosionParticles(config) {
 const group = new THREE.Group();
 const particleCount = config.particles;
-const geometry = new THREE.SphereGeometry(0.1, 8, 8);
-const material = new THREE.MeshBasicMaterial({ 
-color: config.color,
-transparent: true,
-opacity: 1
-});
+const sharedMaterial = getSharedExplosionMaterial(config.color);
 for (let i = 0; i < particleCount; i++) {
-const p = new THREE.Mesh(geometry, material.clone());
+const p = new THREE.Mesh(explosionGeometry, sharedMaterial);
 p.userData.velocity = new THREE.Vector3(
 (Math.random() - 0.5) * config.size * 0.2,
 (Math.random() - 0.5) * config.size * 0.2,
@@ -4471,20 +4908,34 @@ p.userData.velocity = new THREE.Vector3(
 );
 group.add(p);
 }
-group.userData.isEntity = true; 
+group.userData.isEntity = true;
+group.userData.isExplosion = true;
 group.userData.startTime = Date.now();
-group.userData.config = config; 
+group.userData.config = config;
+group.userData.expired = false;
 return group;
 }
 function animateEffects() {
+if (activeExplosions.size === 0) return;
 const now = Date.now();
-entityMeshes.forEach((mesh, id) => {
-if (mesh instanceof THREE.Group && mesh.children.length > 0 && mesh.children[0].userData.velocity) {
-mesh.children.forEach(p => {
+activeExplosions.forEach(function(effectId) {
+const group = entityMeshes.get(effectId);
+if (!group || !group.userData || group.userData.expired) return;
+if (!(group instanceof THREE.Group) || group.children.length === 0) return;
+let allFaded = true;
+const opacityDecay = 0.04;
+const scaleDecay = 0.98;
+for (let i = 0; i < group.children.length; i++) {
+const p = group.children[i];
 p.position.add(p.userData.velocity);
-p.material.opacity *= 0.96;
-p.scale.multiplyScalar(0.98);
-});
+if (p.material.opacity > 0.02) {
+p.material.opacity *= (1 - opacityDecay);
+p.scale.multiplyScalar(scaleDecay);
+allFaded = false;
+}
+}
+if (allFaded) {
+group.userData.expired = true;
 }
 });
 }
@@ -4511,7 +4962,7 @@ for (const effect of data.effects) {
 const effectId = effect.id ?? effect.Id;
 const isDestroyed = effect.isdestroyed === true || String(effect.isdestroyed) === ""true"";
 if (isDestroyed) despawnEntity(effectId);
-else spawnEffectWithTTL(effect, 5000);
+else if (shouldShowEffect(effectId)) spawnEffectWithTTL(effect, 5000);
 }
 }
 visibilityDirty = true;
@@ -4687,7 +5138,7 @@ log('Terrain mesh created', 'success');
 }
 function createWaterMesh() {
 const waterHeight = 1.32;
-const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 96, 96);  
+const waterGeo = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, 96, 96);
 const waterMat = new THREE.MeshPhysicalMaterial({
 color: 0x1e6a8a,
 transparent: true,
@@ -4698,7 +5149,7 @@ clearcoat: 0.5,
 clearcoatRoughness: 0.2,
 reflectivity: 0.8,
 side: THREE.DoubleSide
-}); 
+});
 waterMesh = new THREE.Mesh(waterGeo, waterMat);
 waterMesh.rotation.x = -Math.PI / 2;
 waterMesh.position.y = waterHeight;
@@ -4824,9 +5275,20 @@ tempScale.set(1, 1, length);
 tempMatrix.compose(tempPos, tempQuat, tempScale);
 instancer.setMatrixAt(index, tempMatrix);
 }
-function addCubeInstance(index, x, y, z, scaleX, scaleY, scaleZ) {
+function addCubeInstance(index, x, y, z, scaleX, scaleY, scaleZ, rotX, rotY, rotZ) {
 tempPos.set(x, y, z);
-tempQuat.identity();
+const normalizedRot = {
+x: rotX || 0,
+y: 180 - (rotY || 0),
+z: rotZ || 0
+};
+const eulerRot = new THREE.Euler(
+THREE.MathUtils.degToRad(normalizedRot.x),
+THREE.MathUtils.degToRad(normalizedRot.y),
+THREE.MathUtils.degToRad(normalizedRot.z),
+'YXZ'
+);
+tempQuat.setFromEuler(eulerRot);
 tempScale.set(scaleX, scaleY, scaleZ);
 tempMatrix.compose(tempPos, tempQuat, tempScale);
 cubeInstancer.setMatrixAt(index, tempMatrix);
@@ -4840,8 +5302,9 @@ log('Created ' + cubeCount + ' instanced cube prefabs', 'success');
 }
 function initGLTFLoader() { if (typeof THREE.GLTFLoader !== 'undefined') { gltfLoader = new THREE.GLTFLoader(); } else { log('GLTFLoader not available, will use cube markers', 'error'); } }
 function loadGLBModel(url, onLoad, onError) {
+if (glbFailedOnce.has(url)) {return;}
 if (!gltfLoader) { if (onError) onError('GLTFLoader not initialized'); return; }
-gltfLoader.load(url, function(gltf) { if (onLoad) onLoad(gltf); }, function(progress) { }, function(error) { if (onError) onError(error); });
+gltfLoader.load(url, function(gltf) { if (onLoad) onLoad(gltf); }, function(progress) { }, function(error) {glbFailedOnce.add(url); if (onError) onError(error); });
 }
 async function loadPrefabOffset(prefabName) {
 if (prefabOffsetCache.has(prefabName)) {return prefabOffsetCache.get(prefabName);}
@@ -4922,7 +5385,7 @@ if (isBBMarkerType(prefabName)) { createBBMarkerFromPrefab(prefab); }
 if (prefabName.includes('cube') || prefabName.includes('invisible_collider')) {
 if (cubeInstancer && cubeCount < MAX_CUBE_PREFABS) {
 const markerPos = transformPositionFromUnity(unityX, unityY + 2, unityZ);
-addCubeInstance(cubeCount, markerPos.x, markerPos.y, markerPos.z, baseScale.x, baseScale.y, baseScale.z);
+addCubeInstance(cubeCount, markerPos.x, markerPos.y, markerPos.z, baseScale.x, baseScale.y, baseScale.z, unityRot.x, unityRot.y, unityRot.z);
 cubeCount++;
 } else if (!cubeInstancer) {
 const markerPos = transformPositionFromUnity(unityX, unityY, unityZ);
@@ -4930,6 +5393,18 @@ const markerGeo = new THREE.BoxGeometry(baseScale.x, baseScale.y, baseScale.z);
 const markerMat = new THREE.MeshBasicMaterial({ color: 0x00ff00, opacity: 0.5, transparent: true });
 const marker = new THREE.Mesh(markerGeo, markerMat);
 marker.position.set(markerPos.x, markerPos.y, markerPos.z);
+const normalizedRot = {
+x: unityRot.x || 0,
+y: 180 - (unityRot.y || 0),
+z: unityRot.z || 0
+};
+const eulerRot = new THREE.Euler(
+THREE.MathUtils.degToRad(normalizedRot.x),
+THREE.MathUtils.degToRad(normalizedRot.y),
+THREE.MathUtils.degToRad(normalizedRot.z),
+'YXZ'
+);
+marker.rotation.copy(eulerRot);
 marker.visible = showPrefabs && showCubes;
 scene.add(marker);
 prefabMarkers.push(marker);
@@ -4986,7 +5461,7 @@ log('Started processing ' + maxPrefabs + ' prefabs', 'success');
 function addPrefabLabel(name, x, y, z) {
 const canvas = document.createElement('canvas');
 const ctx = canvas.getContext('2d');
-canvas.width = 512; canvas.height = 128;
+canvas.width = 512; canvas.height = 200;
 ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
 ctx.fillRect(0, 0, 512, 128);
 ctx.fillStyle = '#00ff00';
@@ -5430,6 +5905,7 @@ const lerpFactor = Math.min(1, ENTITY_LERP_SPEED * delta);
 entityTargets.forEach(function(target, entityId) {
 const mesh = entityMeshes.get(entityId);
 if (!mesh) return;
+if (mesh.userData && mesh.userData.isExplosion) return;
 const isPlayer = mesh.userData && mesh.userData.isPlayer;
 if (!mesh.visible && !isPlayer) return;
 const distance = mesh.position.distanceTo(target.position);
